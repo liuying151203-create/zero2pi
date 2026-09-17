@@ -24,3 +24,4 @@ python s01_agent_loop/code.py
 - `lcc` 使用 `agent_loop(messages)` 配合模块级客户端和工具，突出最小循环。
 - 本章保留这个循环，但把模型请求和工具执行作为参数传入，借鉴 `pi` 的职责分离，便于替换和测试。
 - 相比 `pi`，本章暂不引入事件流、状态对象、取消信号和完整运行时，只保留核心闭环。
+- 当前运行示例使用 Anthropic Messages API；DeepSeek 等 OpenAI 兼容模型需要后续 provider adapter，不能只改 `.env`。

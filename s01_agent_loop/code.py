@@ -155,7 +155,12 @@ def main() -> None:
     if not model:
         raise RuntimeError("Set MODEL_ID in .env before running s01_agent_loop.")
 
-    client = Anthropic()
+    client_options: dict[str, str] = {}
+    if api_key := os.getenv("ANTHROPIC_API_KEY"):
+        client_options["api_key"] = api_key
+    if base_url := os.getenv("ANTHROPIC_BASE_URL"):
+        client_options["base_url"] = base_url
+    client = Anthropic(**client_options)
     system = f"You are a coding agent working in {os.getcwd()}. Use bash to solve tasks."
 
     def create_message(**kwargs: Any) -> Any:
