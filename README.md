@@ -21,7 +21,10 @@ Copy-Item .env.example .env
 ## 常用命令
 
 ```powershell
+# 运行第一章：核心循环
+python s01_agent_loop/code.py
+# 运行测试
 python -m pytest
-ruff check src tests
-python -m zero2pi.main
+# 检查代码规范
+ruff check s01_agent_loop src tests
 ```
