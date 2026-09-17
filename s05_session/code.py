@@ -76,7 +76,15 @@ def _to_jsonable(value: Any) -> Any:
 
 @dataclass(frozen=True)
 class SessionMessage:
-    """表示一条可以持久化的对话消息。"""
+    """表示一条可以持久化的对话消息。
+
+    属性：
+        role：消息角色，例如 `user`、`assistant`。
+        content：文本或结构化内容块，写入前会转换为 JSON 基础值。
+        timestamp：消息写入时的 UTC 时间戳，用于观察记录顺序和调试。
+
+    该模型只描述线性会话中的消息，不包含 Pi 后续会话树所需的 parentId、分支和事件类型。
+    """
 
     role: str
     content: Any
@@ -86,7 +94,11 @@ class SessionMessage:
 
     @classmethod
     def from_message(cls, message: Message) -> SessionMessage:
-        """从 Agent 消息创建可序列化的会话消息。"""
+        """从 Agent 内存消息创建可序列化的会话消息。
+
+        输入：核心循环使用的消息字典。
+        输出：带时间戳的 `SessionMessage`；内容中的 SDK 对象会递归转换为普通 JSON 值。
+        """
         return cls(
             role=str(message["role"]),
             content=_to_jsonable(message.get("content", "")),
@@ -94,7 +106,11 @@ class SessionMessage:
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> SessionMessage:
-        """从 JSONL 记录恢复会话消息。"""
+        """从一条已解析的 JSONL 记录恢复会话消息。
+
+        输入：包含 `role`、`content` 和可选 `timestamp` 的记录字典。
+        输出：可供模型上下文使用的 `SessionMessage`；角色缺失或类型错误时抛出 `ValueError`。
+        """
         role = record.get("role")
         if not isinstance(role, str) or not role:
             raise ValueError("Session message role must be a non-empty string")
@@ -105,7 +121,7 @@ class SessionMessage:
         )
 
     def to_record(self) -> dict[str, Any]:
-        """转换为一条 JSONL 记录。"""
+        """把消息转换为 JSONL 存储层使用的记录字典。"""
         return {
             "type": "message",
             "role": self.role,
@@ -114,27 +130,40 @@ class SessionMessage:
         }
 
     def to_message(self) -> Message:
-        """转换为模型 API 使用的消息字典。"""
+        """把持久化消息还原为模型 API 使用的消息字典。"""
         return {"role": self.role, "content": self.content}
 
 
 # ===== s05 新增：JSONL 存储层 =====
 
 class JsonlSessionStore:
-    """负责会话文件的追加写入和顺序读取。"""
+    """负责会话 JSONL 文件的追加写入和顺序读取。
+
+    该层只关心文件格式和 I/O，不决定会话如何参与 Agent loop，也不实现分支或检索。
+    每次追加一行，读取时按文件顺序恢复消息；这种结构便于后续扩展为追加式事件日志。
+    """
 
     def __init__(self, path: Path) -> None:
         self.path = path
 
     def append(self, message: SessionMessage) -> None:
-        """追加一条消息记录；父目录不存在时自动创建。"""
+        """追加一条消息记录。
+
+        输入：已经完成模型内容标准化的 `SessionMessage`。
+        输出：无；父目录不存在时创建目录，并向文件末尾写入一行 JSON。
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(message.to_record(), ensure_ascii=False)
         with self.path.open("a", encoding="utf-8", newline="\n") as file:
             file.write(line + "\n")
 
     def read_all(self) -> list[SessionMessage]:
-        """按文件顺序读取全部消息，并在记录损坏时报告行号。"""
+        """按文件顺序读取全部消息，并在记录损坏时报告行号。
+
+        输入：无，数据来源为构造函数指定的 JSONL 文件。
+        输出：按写入顺序排列的消息列表；文件不存在时返回空列表。
+        异常：JSON 无法解析、记录类型错误或消息角色非法时抛出带行号的 `ValueError`。
+        """
         if not self.path.exists():
             return []
 
@@ -157,27 +186,44 @@ class JsonlSessionStore:
 # ===== s05 新增：会话管理层 =====
 
 class SessionManager:
-    """协调消息模型与 JSONL 存储，向 Agent 提供加载和追加接口。"""
+    """协调消息模型与 JSONL 存储，向 Agent 提供加载和追加接口。
+
+    作用：隔离 Agent loop 与具体文件格式，让核心循环只需要一个“保存消息”的函数，
+    终端入口则通过管理器恢复历史并追加新消息。
+
+    当前管理器只支持单文件、线性会话；分支、父子节点和上下文压缩留到后续章节。
+    """
 
     def __init__(self, store: JsonlSessionStore) -> None:
         self.store = store
 
     @classmethod
     def open(cls, path: Path) -> SessionManager:
-        """打开一个已有或待创建的线性会话文件。"""
+        """打开一个已有或待创建的线性会话文件。
+
+        输入：会话 JSONL 文件路径。
+        输出：绑定到该路径的 `SessionManager`；文件不会在打开时立即创建。
+        """
         return cls(JsonlSessionStore(path))
 
     @property
     def path(self) -> Path:
-        """返回当前会话文件路径。"""
+        """返回当前会话文件路径，供终端提示和调试使用。"""
         return self.store.path
 
     def load_messages(self) -> list[Message]:
-        """读取会话并转换为模型消息历史。"""
+        """读取会话并转换为模型消息历史。
+
+        输出：按原始顺序排列、可直接传给模型客户端的消息字典列表。
+        """
         return [entry.to_message() for entry in self.store.read_all()]
 
     def append_message(self, message: Message) -> None:
-        """把一条 Agent 消息追加到会话文件。"""
+        """把一条 Agent 内存消息转换并追加到会话文件。
+
+        输入：核心循环产生的 user、assistant 或工具结果消息。
+        输出：无；转换和写入由 `SessionMessage` 与 `JsonlSessionStore` 完成。
+        """
         self.store.append(SessionMessage.from_message(message))
 
 

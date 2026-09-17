@@ -212,7 +212,11 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 # ===== s03 新增：权限状态与判断结果 =====
 
 class PermissionStatus(StrEnum):
-    """工具调用经过权限检查后的三种状态。"""
+    """工具调用经过权限检查后的三种状态。
+
+    `ALLOW` 表示无需交互即可执行，`ASK` 表示需要用户确认，`DENY` 表示
+    即使用户没有参与也不能执行。权限策略返回这个枚举，执行层据此决定后续流程。
+    """
 
     ALLOW = "allow"
     ASK = "ask"
@@ -222,7 +226,15 @@ class PermissionStatus(StrEnum):
 # s03 新增：用不可变结果统一表达允许、询问和拒绝，避免权限分支散落在工具函数中。
 @dataclass(frozen=True)
 class PermissionDecision:
-    """描述权限状态及其面向用户的原因。"""
+    """描述一次权限判断的结果。
+
+    属性：
+        status：允许、询问或拒绝的状态。
+        reason：面向用户或模型解释该决定的简短原因。
+
+    该对象使用 `frozen=True`，表示权限判断完成后结果不可修改，避免执行过程中
+    意外改变安全决定。
+    """
 
     status: PermissionStatus
     reason: str
@@ -308,7 +320,14 @@ def confirm_permission(name: str, arguments: dict[str, Any], reason: str) -> boo
 # 与 s02 的差异是先检查权限，再调用 handler；后续 s04 会把这一步抽成 before hook。
 
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
-    """根据工具名查找处理函数，并把模型参数传给它。"""
+    """执行一个已经通过调用入口的工具分发请求。
+
+    作用：只负责根据工具注册表调用 handler；权限判断由 `execute_tool` 在它之前完成，
+    从而保持工具实现与安全策略分离。
+
+    输入：工具名称和参数字典。
+    输出：成功时返回 handler 结果，未知工具、参数错误或运行异常时返回错误文本。
+    """
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return f"Error: unknown tool: {name}"
@@ -332,8 +351,16 @@ def execute_tool(
     """完成一次工具调用的权限检查、确认和执行。
 
     作用：把权限流程集中在一个入口，避免每个工具处理函数重复实现确认逻辑。
-    输入：工具名称、工具参数、实际分发函数，以及可替换的权限检查和确认函数。
+    输入：
+        name：模型选择的工具名称。
+        arguments：模型生成的工具参数。
+        dispatch：实际执行工具的分发函数。
+        permission：返回 `PermissionDecision` 的权限检查函数。
+        confirm：处理 `ASK` 状态并返回用户选择的确认函数。
+
     输出：工具结果文本；拒绝或取消确认也会转成结果文本返回给模型。
+
+    流程：权限检查 → `DENY` 直接返回 → `ASK` 请求确认 → 用户允许后调用 dispatch。
     """
     # s03 新增：所有工具调用先经过可注入的权限函数，再决定是否执行。
     decision = permission(name, arguments)

@@ -60,7 +60,15 @@ AfterToolHook = Callable[[str, dict[str, Any], str], str]
 
 @dataclass
 class Hooks:
-    """按工具调用生命周期保存前置和后置 Hook。"""
+    """按工具调用生命周期保存前置和后置 Hook。
+
+    属性：
+        before_tool_call：在 dispatch 前按注册顺序执行，可返回字符串阻断调用。
+        after_tool_call：在工具执行或阻断后按注册顺序执行，可返回新的结果文本。
+
+    这是一个轻量的同步 Hook 容器。它不负责注册全局插件，也不负责并行调度，
+    只为当前 Agent loop 提供清晰、可测试的生命周期依赖。
+    """
 
     # s04 新增：前置 Hook 控制工具能否进入 dispatch。
     before_tool_call: list[BeforeToolHook] = field(default_factory=list)
@@ -75,7 +83,13 @@ def run_before_hooks(
     arguments: dict[str, Any],
     hooks: Hooks,
 ) -> str | None:
-    """按注册顺序运行前置 Hook，并返回第一个阻断原因。"""
+    """按注册顺序运行前置 Hook，并返回第一个阻断原因。
+
+    输入：工具名称、参数字典和 Hook 容器。
+    输出：所有 Hook 放行时返回 `None`；某个 Hook 阻断时返回原因文本；Hook 自身
+    抛出异常时返回可回传模型的错误文本。
+    流程：依次调用 Hook → 遇到非空返回值立即停止 → 将阻断原因交给执行入口。
+    """
     for hook in hooks.before_tool_call:
         try:
             # s04 新增：前置 Hook 返回字符串表示阻断，None 表示继续执行。
@@ -93,7 +107,13 @@ def run_after_hooks(
     result: str,
     hooks: Hooks,
 ) -> str:
-    """按注册顺序处理工具结果，并把结果传给下一个 Hook。"""
+    """按注册顺序处理工具结果，并把结果传给下一个 Hook。
+
+    输入：工具名称、参数字典、当前结果文本和 Hook 容器。
+    输出：经过全部后置 Hook 处理后的结果文本。
+    流程：第一个 Hook 接收原始结果，后续 Hook 接收前一个 Hook 的返回值；如果
+    某个 Hook 出错，则保留当前结果并追加错误说明，避免隐藏工具结果。
+    """
     current = result
     for hook in hooks.after_tool_call:
         try:
@@ -111,7 +131,13 @@ def make_permission_hook(
     permission: PermissionCheck = previous.check_permission,
     confirm: PermissionConfirm = previous.confirm_permission,
 ) -> BeforeToolHook:
-    """创建一个复用 s03 权限策略的前置 Hook。"""
+    """创建一个复用 s03 权限策略的前置 Hook。
+
+    输入：可替换的权限检查函数和用户确认函数；默认使用 s03 的实现。
+    输出：符合 `BeforeToolHook` 签名的闭包，允许时返回 `None`，阻断时返回原因文本。
+    流程：调用权限检查 → 拒绝则阻断 → 询问状态请求用户确认 → 确认后放行。
+    这样 s04 只改变权限逻辑的接入位置，不复制或重写 s03 的规则。
+    """
 
     def permission_hook(name: str, arguments: dict[str, Any]) -> str | None:
         decision = permission(name, arguments)

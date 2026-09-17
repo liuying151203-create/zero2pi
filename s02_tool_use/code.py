@@ -213,7 +213,21 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 # ===== s02 新增：统一工具分发 =====
 
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
-    """根据工具名查找处理函数，并把模型参数传给它。"""
+    """根据工具名查找并执行对应的工具处理函数。
+
+    作用：把模型返回的工具名称和参数转换成统一的 handler 调用，隔离核心循环
+    与具体工具实现。
+
+    输入：
+        name：模型返回的工具名称。
+        arguments：模型生成的 JSON 参数字典。
+
+    输出：
+        工具处理函数返回的结果文本；未知工具、参数错误或运行异常都会转换为
+        可回传给模型的错误文本。
+
+    流程：查找注册表 → 调用 handler → 捕获工具边界内的异常 → 返回统一文本结果。
+    """
     # s02 新增：统一从注册表查找 handler，让 agent_loop 不依赖具体工具实现。
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
