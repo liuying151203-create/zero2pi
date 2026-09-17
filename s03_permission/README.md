@@ -25,6 +25,34 @@ flowchart TD
 tool_call → check_permission → confirm（必要时） → dispatch → tool_result
 ```
 
+## 组件关系与调用链
+
+本章新增的核心组件如下：
+
+| 组件 | 作用 |
+| --- | --- |
+| `PermissionStatus` | 表示 `allow`、`ask`、`deny` 三种决定 |
+| `PermissionDecision` | 携带权限状态和原因的不可变结果对象 |
+| `check_permission()` | 根据工具名称、路径和命令规则生成权限决定 |
+| `confirm_permission()` | 对 `ask` 状态发起终端确认 |
+| `execute_tool()` | 组织权限检查、用户确认和实际执行 |
+| `dispatch_tool()` | 只负责查找并执行具体 handler，沿用 s02 |
+
+核心调用关系是：
+
+```text
+agent_loop()
+    ↓
+execute_tool()
+    ├─ check_permission()
+    ├─ confirm_permission()  （仅 ask）
+    └─ dispatch_tool()
+           ↓
+       具体工具 handler
+```
+
+`check_permission()` 只做策略判断，`confirm_permission()` 只负责交互，`dispatch_tool()` 只负责执行。`execute_tool()` 是本章的组合入口，因此后续 s04 可以只替换这个入口的生命周期，而不用把权限代码散落到每个工具中。
+
 只读工具自动允许；写入、编辑和可能产生副作用的命令需要确认；明显高危命令直接拒绝。权限拒绝会作为工具结果返回模型，核心循环不会因此崩溃。
 
 ## 运行

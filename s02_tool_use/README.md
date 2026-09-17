@@ -8,6 +8,34 @@
 tool_name + arguments → TOOL_HANDLERS → handler(**arguments) → tool_result
 ```
 
+## 组件关系与调用链
+
+本章没有新增类，核心职责由三个数据/函数层次组成：
+
+| 组件 | 作用 |
+| --- | --- |
+| `TOOLS` | 告诉模型有哪些工具以及参数格式；只描述协议，不执行工具 |
+| `TOOL_HANDLERS` | 保存工具名称到 Python 处理函数的映射 |
+| `dispatch_tool()` | 根据名称查找 handler，统一捕获参数和运行错误 |
+| `agent_loop()` | 请求模型、提取 `tool_use`、调用分发器并回传 `tool_result` |
+| `run_read()` / `run_write()` / `run_edit()` / `run_glob()` | 各自负责一种具体文件操作 |
+
+调用关系是：
+
+```text
+agent_loop
+    ↓
+dispatch_tool(name, arguments)
+    ↓
+TOOL_HANDLERS[name]
+    ↓
+具体 run_* 方法
+    ↓
+tool_result
+```
+
+这样拆分的原因是：核心循环只负责 Agent 协议，分发器只负责查找和错误边界，具体方法只负责工具本身。新增工具时主要增加定义、处理函数和注册映射，不需要改动循环。
+
 新增工具只需要两步：
 
 1. 在 `TOOLS` 中声明名称、用途和参数 schema；

@@ -25,6 +25,39 @@ flowchart TD
 Message → SessionMessage → JsonlSessionStore → SessionManager
 ```
 
+## 组件关系与调用链
+
+本章新增的核心组件分为三层：
+
+| 层次 | 组件 | 作用 |
+| --- | --- | --- |
+| 消息模型 | `SessionMessage` | 在 Agent 消息和 JSONL 记录之间转换 |
+| 存储层 | `JsonlSessionStore` | 只负责文件追加写入和顺序读取 |
+| 管理层 | `SessionManager` | 对外提供打开、加载和追加消息的接口 |
+
+辅助方法的关系：
+
+- `_to_jsonable()`：把 Anthropic SDK 对象转换成普通 JSON 值，供 `SessionMessage` 使用；
+- `_append_message()`：同时更新内存 `messages` 和持久化存储，避免两边写法不一致；
+- `agent_loop()`：在 assistant 和 tool_result 消息产生时调用保存函数；
+- `main()`：创建 `SessionManager`，启动时加载历史，并把 `session.append_message` 注入 `agent_loop()`。
+
+完整调用关系是：
+
+```text
+main()
+    ├─ SessionManager.open()
+    ├─ SessionManager.load_messages()
+    │      └─ JsonlSessionStore.read_all()
+    └─ agent_loop(save_message=session.append_message)
+           └─ _append_message()
+                  ├─ 更新内存 messages
+                  └─ SessionManager.append_message()
+                         └─ JsonlSessionStore.append()
+```
+
+这样设计的重点是隔离职责：存储层不理解 Agent loop，管理层不处理模型响应，核心循环只依赖一个可选的保存函数。后续替换为数据库、树形 session 或内存存储时，不需要重写工具和模型调用流程。
+
 会话文件默认保存到 `.sessions/default.jsonl`，每行是一条带 `role`、`content` 和时间戳的消息记录。模型 SDK 的响应对象会先转换为普通字典，再写入 JSONL。
 
 ## 运行
