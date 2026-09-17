@@ -29,8 +29,10 @@ python s02_tool_use/code.py
 python s03_permission/code.py
 # 运行第四章：工具调用 Hooks
 python s04_hooks/code.py
+# 运行第五章：会话持久化
+python s05_session/code.py
 # 运行测试
 python -m pytest
 # 检查代码规范
-ruff check s01_agent_loop s02_tool_use s03_permission src tests
+ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session src tests
 ```

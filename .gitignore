@@ -15,6 +15,9 @@ dist/
 .env.*
 !.env.example
 
+# Runtime session data
+.sessions/
+
 # IDE and OS files
 .idea/
 .vscode/
