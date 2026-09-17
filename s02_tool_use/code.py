@@ -383,6 +383,7 @@ def main() -> None:
 
         history.append({"role": "user", "content": query})
         try:
+            # s02 修改：相对 s01，交互入口把多工具分发器注入核心循环。
             agent_loop(
                 history,
                 create_message=create_message,

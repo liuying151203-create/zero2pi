@@ -43,7 +43,7 @@ dispatch_tool = previous.dispatch_tool
 execute_tool = previous.execute_tool
 WORKDIR = previous.WORKDIR
 
-# ===== s05 修改：全局系统提示词 =====
+# ===== 来自 s04：全局系统提示词（保持） =====
 # 会话是否持久化是 Harness 的内部行为，不需要写进系统提示词。
 
 SYSTEM = (
@@ -258,6 +258,7 @@ def agent_loop(
     dispatch: DispatchTool,
     system: str,
     hooks: Hooks,
+    # s05 新增：通过可选保存函数接入会话，核心循环仍可只使用内存历史。
     save_message: SessionSaver | None = None,
     tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 8000,
@@ -402,6 +403,7 @@ def main() -> None:
                 dispatch=dispatch_tool,
                 system=SYSTEM,
                 hooks=hooks,
+                # s05 修改：相对 s04，将 SessionManager 的追加方法注入核心循环。
                 save_message=session.append_message,
             )
         except (RuntimeError, ValueError) as error:

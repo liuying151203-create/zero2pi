@@ -45,8 +45,8 @@ CreateMessage = Callable[..., Any]
 
 WORKDIR = Path.cwd()
 
-# ===== s03 修改：全局系统提示词 =====
-# 只补充权限行为提示；权限判断仍由下面的 Python 代码负责。
+# ===== 来自 s02：全局系统提示词（保持） =====
+# s03 的权限属于 Harness 内部机制，不写入系统提示词。
 
 SYSTEM = (
     f"你是运行在 {WORKDIR} 的编程 Agent。"
@@ -316,8 +316,7 @@ def confirm_permission(name: str, arguments: dict[str, Any], reason: str) -> boo
     return answer in {"y", "yes"}
 
 
-# ===== s03 修改：统一工具分发 =====
-# 与 s02 的差异是先检查权限，再调用 handler；后续 s04 会把这一步抽成 before hook。
+# ===== 来自 s02：统一工具分发（保持） =====
 
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
     """执行一个已经通过调用入口的工具分发请求。
@@ -339,6 +338,8 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
     except Exception as error:  # noqa: BLE001 - 工具错误要回传给模型
         return f"Error running {name}: {error}"
 
+
+# ===== s03 新增：权限门禁执行入口 =====
 
 def execute_tool(
     name: str,
@@ -389,6 +390,7 @@ def agent_loop(
     create_message: CreateMessage,
     dispatch: DispatchTool,
     system: str,
+    # s03 新增：将权限判断和确认函数注入工具执行入口，便于替换和测试。
     permission: PermissionCheck = check_permission,
     confirm: PermissionConfirm = confirm_permission,
     tools: list[dict[str, Any]] | None = None,
@@ -429,6 +431,7 @@ def agent_loop(
                 name,
                 arguments,
                 dispatch=dispatch,
+                # s03 修改：相对 s02，把权限依赖传入工具执行入口。
                 permission=permission,
                 confirm=confirm,
             )

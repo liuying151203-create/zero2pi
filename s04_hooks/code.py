@@ -42,6 +42,7 @@ dispatch_tool = previous.dispatch_tool
 WORKDIR = previous.WORKDIR
 
 # ===== s04 修改：全局系统提示词 =====
+# 相对 s03 继续精简提示词；Windows 命令语法由 bash 工具描述负责。
 
 SYSTEM = (
     f"你是运行在 {WORKDIR} 的编程 Agent。"
@@ -200,6 +201,7 @@ def agent_loop(
     create_message: Callable[..., Any],
     dispatch: DispatchTool,
     system: str,
+    # s04 新增：用 Hooks 容器替代 s03 的 permission/confirm 两个独立参数。
     hooks: Hooks,
     tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 8000,
