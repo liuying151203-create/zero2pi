@@ -2,6 +2,25 @@
 
 这一章在 s02 的工具分发前增加权限门禁，区分自动允许、需要用户确认和直接拒绝三种结果。
 
+## 架构流程
+
+```mermaid
+flowchart TD
+    A[用户输入] --> B[请求模型]
+    B --> C{是否请求工具}
+    C -- 否 --> D[输出模型回答]
+    C -- 是 --> E[展示工具调用]
+    E --> F{权限检查}
+    F -- allow --> G[dispatch 执行工具]
+    F -- ask --> H[请求用户确认]
+    H -- 同意 --> G
+    H -- 拒绝 --> I[生成拒绝结果]
+    F -- deny --> I
+    G --> J[tool_result]
+    I --> J
+    J --> B
+```
+
 ```text
 tool_call → check_permission → confirm（必要时） → dispatch → tool_result
 ```

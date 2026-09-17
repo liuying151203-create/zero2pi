@@ -2,6 +2,21 @@
 
 这一章复用 s03 的工具和权限策略，把工具执行前后的扩展逻辑抽成可注入的 Hooks。
 
+## 架构流程
+
+```mermaid
+flowchart TD
+    A[模型返回 tool_call] --> B[before_tool_call Hooks]
+    B --> C{是否阻断}
+    C -- 是 --> D[生成阻断结果]
+    C -- 否 --> E[dispatch 执行工具]
+    E --> F[工具结果]
+    D --> G[after_tool_call Hooks]
+    F --> G
+    G --> H[最终 tool_result]
+    H --> I[回传模型]
+```
+
 ```text
 tool_call → before_tool_call → dispatch → after_tool_call → tool_result
 ```

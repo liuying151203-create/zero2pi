@@ -2,6 +2,25 @@
 
 这一章在 s04 的 Agent loop 上增加线性会话持久化，让程序退出后可以恢复之前的对话。
 
+## 架构流程
+
+```mermaid
+flowchart TD
+    A[启动程序] --> B[SessionManager 加载 JSONL]
+    B --> C[恢复 messages]
+    C --> D[Agent loop]
+    E[用户输入] --> F[追加 user 消息]
+    F --> G[请求模型]
+    G --> H[标准化 assistant 消息]
+    H --> I[追加到内存和 JSONL]
+    I --> J{是否请求工具}
+    J -- 是 --> K[Hooks 与工具执行]
+    K --> L[追加 tool_result]
+    L --> G
+    J -- 否 --> M[输出回答]
+    M --> N[退出后下次继续加载]
+```
+
 ```text
 Message → SessionMessage → JsonlSessionStore → SessionManager
 ```
