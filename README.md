@@ -23,6 +23,8 @@ Copy-Item .env.example .env
 ```powershell
 # 运行第一章：核心循环
 python s01_agent_loop/code.py
+# 运行第二章：工具调用
+python s02_tool_use/code.py
 # 运行测试
 python -m pytest
 # 检查代码规范
