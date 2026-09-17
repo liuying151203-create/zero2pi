@@ -58,7 +58,7 @@ execute_tool()
 ## 运行
 
 ```powershell
-python s03_permission/code.py
+python -m s03_permission.code
 ```
 
 可以尝试：`读取 README.md`、`创建一个测试文件`、`执行 dir`。写入文件时终端会显示原因并等待输入 `y` 或 `n`。

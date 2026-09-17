@@ -63,10 +63,10 @@ main()
 ## 运行
 
 ```powershell
-python s05_session/code.py
+python -m s05_session.code
 ```
 
-退出后再次运行，程序会继续读取同一个会话文件。也可以通过 `SESSION_FILE` 环境变量指定其他 JSONL 文件。
+从项目根目录使用 `-m` 运行，确保章节之间的兄弟模块可以正常导入。退出后再次运行，程序会继续读取同一个会话文件。也可以通过 `SESSION_FILE` 环境变量指定其他 JSONL 文件。
 
 ## 参考与差异
 

@@ -50,7 +50,7 @@ tool_result
 在项目根目录执行：
 
 ```powershell
-python s02_tool_use/code.py
+python -m s02_tool_use.code
 ```
 
 示例任务：`读取 README.md`、`查找所有 Python 文件`、`创建一个测试文件再读回来`。

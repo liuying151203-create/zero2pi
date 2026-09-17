@@ -14,7 +14,7 @@
 ```powershell
 Copy-Item .env.example .env
 # 在 .env 中填写 ANTHROPIC_API_KEY 和 MODEL_ID
-python s01_agent_loop/code.py
+python -m s01_agent_loop.code
 ```
 
 本章直接执行模型生成的 shell 命令，仅用于理解循环机制，请在临时目录中运行。权限控制留到后续章节。

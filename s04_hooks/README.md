@@ -55,7 +55,7 @@ execute_tool()
 ## 运行
 
 ```powershell
-python s04_hooks/code.py
+python -m s04_hooks.code
 ```
 
 本章默认把 s03 的权限策略注册为 `before_tool_call`，因此写入文件和高风险命令仍会请求确认。

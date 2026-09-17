@@ -22,15 +22,15 @@ Copy-Item .env.example .env
 
 ```powershell
 # 运行第一章：核心循环
-python s01_agent_loop/code.py
+python -m s01_agent_loop.code
 # 运行第二章：工具调用
-python s02_tool_use/code.py
+python -m s02_tool_use.code
 # 运行第三章：工具权限
-python s03_permission/code.py
+python -m s03_permission.code
 # 运行第四章：工具调用 Hooks
-python s04_hooks/code.py
+python -m s04_hooks.code
 # 运行第五章：会话持久化
-python s05_session/code.py
+python -m s05_session.code
 # 运行测试
 python -m pytest
 # 检查代码规范
