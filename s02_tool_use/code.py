@@ -21,8 +21,8 @@ from typing import Any
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-# ===== 来自上一节：消息类型与模型调用类型 =====
-# 本节保留 s01 的消息结构，并新增工具处理函数和分发器类型。
+# ===== 来自 s01：消息类型与模型调用类型 =====
+# s02 保留 s01 的消息结构，并新增工具处理函数和分发器类型。
 
 Message = dict[str, Any]
 ToolHandler = Callable[..., str]
@@ -31,7 +31,7 @@ DispatchTool = Callable[[str, dict[str, Any]], str]
 WORKDIR = Path.cwd()
 
 
-# ===== 来自上一节：bash 工具（保持） =====
+# ===== 来自 s01：bash 工具（保持） =====
 
 def run_bash(command: str) -> str:
     """在工作目录执行 shell 命令。"""
@@ -55,7 +55,7 @@ def run_bash(command: str) -> str:
     return output or "(no output)"
 
 
-# ===== 本节新增：工作区路径与文件工具 =====
+# ===== s02 新增：工作区路径与文件工具 =====
 
 def safe_path(path: str) -> Path:
     """把相对路径解析到工作目录内，拒绝越界路径。"""
@@ -118,7 +118,7 @@ def run_glob(pattern: str) -> str:
         return f"Error: {error}"
 
 
-# ===== 本节新增：工具定义 =====
+# ===== s02 新增：工具定义 =====
 
 TOOLS = [
     {
@@ -178,7 +178,7 @@ TOOLS = [
     },
 ]
 
-# ===== 本节新增：工具注册表 =====
+# ===== s02 新增：工具注册表 =====
 
 TOOL_HANDLERS: dict[str, ToolHandler] = {
     "bash": run_bash,
@@ -189,7 +189,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 }
 
 
-# ===== 本节新增：统一工具分发 =====
+# ===== s02 新增：统一工具分发 =====
 
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
     """根据工具名查找处理函数，并把模型参数传给它。"""
@@ -205,7 +205,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
         return f"Error running {name}: {error}"
 
 
-# ===== 来自上一节：响应读取辅助（保持） =====
+# ===== 来自 s01：响应读取辅助（保持） =====
 
 def _get(block: Any, name: str) -> Any:
     """兼容读取 SDK 对象和测试替身中的字段。"""
@@ -214,8 +214,8 @@ def _get(block: Any, name: str) -> Any:
     return getattr(block, name, None)
 
 
-# ===== 来自上一节：核心循环；本节修改工具执行入口 =====
-# 与 lcc 只把 bash 替换为查表调用的写法一致；这里额外保留 dispatch 注入，便于测试和复用。
+# ===== 来自 s01：核心循环；s02 修改工具执行入口 =====
+# 与 lcc 只把 bash 替换为查表调用的写法一致；s02 额外保留 dispatch 注入，便于测试和复用。
 
 def agent_loop(
     messages: list[Message],
@@ -280,7 +280,7 @@ def agent_loop(
         messages.append({"role": "user", "content": results})
 
 
-# ===== 来自上一节：终端输出辅助（保持） =====
+# ===== 来自 s01：终端输出辅助（保持） =====
 
 def _text_from_content(content: Any) -> str:
     """提取模型响应中的文本块，用于终端展示。"""
@@ -294,7 +294,7 @@ def _text_from_content(content: Any) -> str:
     )
 
 
-# ===== 来自上一节：交互入口；本节修改工具配置 =====
+# ===== 来自 s01：交互入口；s02 修改工具配置 =====
 
 def main() -> None:
     """启动第二章的多工具终端 Agent。
