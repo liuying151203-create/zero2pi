@@ -17,9 +17,13 @@ from typing import Any
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+# ===== s01 基础：消息与依赖类型 =====
+
 Message = dict[str, Any]
 CreateMessage = Callable[..., Any]
 ExecuteTool = Callable[[str], str]
+
+# ===== s01 新增：最小 bash 工具定义 =====
 
 TOOLS = [
     {
@@ -33,6 +37,8 @@ TOOLS = [
     }
 ]
 
+
+# ===== s01 新增：工具执行 =====
 
 def run_bash(command: str, *, cwd: str | None = None) -> str:
     """执行一条 shell 命令并返回标准输出和错误输出。"""
@@ -56,12 +62,17 @@ def run_bash(command: str, *, cwd: str | None = None) -> str:
     return output or "(no output)"
 
 
+# ===== s01 基础：响应读取辅助 =====
+
 def _get(block: Any, name: str) -> Any:
     """兼容读取 SDK 对象和测试替身中的字段。"""
     if isinstance(block, dict):
         return block.get(name)
     return getattr(block, name, None)
 
+
+# ===== s01 新增：核心循环 =====
+# 与 lcc 的最小示例相比，本实现把模型请求和工具执行作为参数注入，便于测试和后续替换。
 
 def agent_loop(
     messages: list[Message],
@@ -128,6 +139,8 @@ def agent_loop(
         messages.append({"role": "user", "content": results})
 
 
+# ===== s01 基础：终端输出 =====
+
 def _text_from_content(content: Any) -> str:
     """提取模型响应中的文本块，用于终端展示。"""
     if isinstance(content, str):
@@ -140,6 +153,8 @@ def _text_from_content(content: Any) -> str:
         if (text := _get(block, "text"))
     )
 
+
+# ===== s01 新增：交互入口 =====
 
 def main() -> None:
     """启动第一章的交互式终端 Agent。
