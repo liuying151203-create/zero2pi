@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -155,7 +156,13 @@ def main() -> None:
     if not model:
         raise RuntimeError("Set MODEL_ID in .env before running s01_agent_loop.")
 
-    client_options: dict[str, str] = {}
+    timeout_seconds = float(os.getenv("MODEL_TIMEOUT_SECONDS", "60"))
+    max_retries = int(os.getenv("MODEL_MAX_RETRIES", "0"))
+
+    client_options: dict[str, Any] = {
+        "timeout": timeout_seconds,
+        "max_retries": max_retries,
+    }
     if api_key := os.getenv("ANTHROPIC_API_KEY"):
         client_options["api_key"] = api_key
     if base_url := os.getenv("ANTHROPIC_BASE_URL"):
@@ -164,7 +171,11 @@ def main() -> None:
     system = f"You are a coding agent working in {os.getcwd()}. Use bash to solve tasks."
 
     def create_message(**kwargs: Any) -> Any:
-        return client.messages.create(model=model, **kwargs)
+        print(f"正在请求模型（超时 {timeout_seconds:g} 秒）...", flush=True)
+        try:
+            return client.messages.create(model=model, **kwargs)
+        except Exception as error:
+            raise RuntimeError(f"模型请求失败：{error}") from error
 
     print("s01：核心循环")
     print("输入任务，输入 q 退出。\n")
@@ -181,12 +192,16 @@ def main() -> None:
             return
 
         history.append({"role": "user", "content": query})
-        agent_loop(
-            history,
-            create_message=create_message,
-            execute_tool=run_bash,
-            system=system,
-        )
+        try:
+            agent_loop(
+                history,
+                create_message=create_message,
+                execute_tool=run_bash,
+                system=system,
+            )
+        except RuntimeError as error:
+            print(f"\n{error}", file=sys.stderr)
+            continue
         print(_text_from_content(history[-1]["content"]))
         print()
 

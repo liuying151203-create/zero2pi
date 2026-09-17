@@ -19,6 +19,8 @@ python s01_agent_loop/code.py
 
 本章直接执行模型生成的 shell 命令，仅用于理解循环机制，请在临时目录中运行。权限控制留到后续章节。
 
+默认单次请求超时 60 秒且不自动重试；可通过 `MODEL_TIMEOUT_SECONDS` 和 `MODEL_MAX_RETRIES` 调整。运行时会显示请求进度，网络或 API 错误会直接打印出来。
+
 ## 参考与差异
 
 - `lcc` 使用 `agent_loop(messages)` 配合模块级客户端和工具，突出最小循环。
