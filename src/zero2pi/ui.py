@@ -52,6 +52,25 @@ def format_tool_result(output: str, limit: int = 200) -> str:
     return _paint("\n".join(rendered), "34")
 
 
+def format_permission_request(
+    tool_name: str,
+    arguments: dict[str, Any],
+    reason: str,
+) -> str:
+    """格式化需要用户确认的工具调用。"""
+    payload = json.dumps(arguments, ensure_ascii=False, default=str)
+    return _paint(
+        "\n".join(
+            (
+                f"权限  ⚠️ {reason}",
+                f"工具  {tool_name}",
+                f"参数  {payload}",
+            )
+        ),
+        "35",
+    )
+
+
 def format_assistant_message(text: str) -> str:
     """格式化 Agent 的最终文本回答。"""
     content = text or "(no text)"

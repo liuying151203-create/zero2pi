@@ -25,8 +25,10 @@ Copy-Item .env.example .env
 python s01_agent_loop/code.py
 # 运行第二章：工具调用
 python s02_tool_use/code.py
+# 运行第三章：工具权限
+python s03_permission/code.py
 # 运行测试
 python -m pytest
 # 检查代码规范
-ruff check s01_agent_loop src tests
+ruff check s01_agent_loop s02_tool_use s03_permission src tests
 ```
