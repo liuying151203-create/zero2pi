@@ -21,6 +21,15 @@ from typing import Any
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from zero2pi.ui import (
+    format_assistant_message,
+    format_error,
+    format_model_request,
+    format_tool_call,
+    format_tool_result,
+    format_user_prompt,
+)
+
 # ===== 来自 s01：消息类型与模型调用类型 =====
 # s02 保留 s01 的消息结构，并新增工具处理函数和分发器类型。
 
@@ -29,6 +38,15 @@ ToolHandler = Callable[..., str]
 DispatchTool = Callable[[str, dict[str, Any]], str]
 
 WORKDIR = Path.cwd()
+
+# ===== s02 修改：全局系统提示词 =====
+# 在 s01 的全局提示词基础上，增加“优先使用专用工具”的约束。
+
+SYSTEM = (
+    f"你是运行在 {WORKDIR} 的编程 Agent。"
+    "只有任务需要操作工作区时才使用工具；问候和简单问题直接回答。"
+    "优先使用最具体的工具，使用最少行动，完成后停止。Windows 下使用 cmd.exe 命令。"
+)
 
 
 # ===== 来自 s01：bash 工具（保持） =====
@@ -123,7 +141,7 @@ def run_glob(pattern: str) -> str:
 TOOLS = [
     {
         "name": "bash",
-        "description": "Run a shell command in the current workspace.",
+        "description": "Run one shell command in the current workspace. On Windows, use cmd.exe syntax.",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -266,9 +284,9 @@ def agent_loop(
         for block in tool_calls:
             name = _get(block, "name")
             arguments = _get(block, "input") or {}
-            print(f"调用工具：{name}", flush=True)
+            print(format_tool_call(name, arguments), flush=True)
             output = dispatch(name, arguments)
-            print(output[:200], flush=True)
+            print(format_tool_result(output), flush=True)
             results.append(
                 {
                     "type": "tool_result",
@@ -323,10 +341,8 @@ def main() -> None:
         client_options["base_url"] = base_url
 
     client = Anthropic(**client_options)
-    system = f"You are a coding agent working in {WORKDIR}. Use tools to solve tasks."
-
     def create_message(**kwargs: Any) -> Any:
-        print(f"正在请求模型（超时 {timeout_seconds:g} 秒）...", flush=True)
+        print(format_model_request(timeout_seconds), flush=True)
         try:
             return client.messages.create(model=model, **kwargs)
         except Exception as error:
@@ -338,7 +354,7 @@ def main() -> None:
     history: list[Message] = []
     while True:
         try:
-            query = input("s02 >> ").strip()
+            query = input(format_user_prompt("s02")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -352,12 +368,12 @@ def main() -> None:
                 history,
                 create_message=create_message,
                 dispatch=dispatch_tool,
-                system=system,
+                system=SYSTEM,
             )
         except RuntimeError as error:
-            print(f"\n{error}", file=sys.stderr)
+            print(f"\n{format_error(str(error))}", file=sys.stderr)
             continue
-        print(_text_from_content(history[-1]["content"]))
+        print(format_assistant_message(_text_from_content(history[-1]["content"])))
         print()
 
 

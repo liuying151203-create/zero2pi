@@ -17,18 +17,35 @@ from typing import Any
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from zero2pi.ui import (
+    format_assistant_message,
+    format_error,
+    format_model_request,
+    format_tool_call,
+    format_tool_result,
+    format_user_prompt,
+)
+
 # ===== s01 基础：消息与依赖类型 =====
 
 Message = dict[str, Any]
 CreateMessage = Callable[..., Any]
 ExecuteTool = Callable[[str], str]
 
+# ===== s01 新增：全局系统提示词 =====
+
+SYSTEM = (
+    f"你是运行在 {os.getcwd()} 的编程 Agent。"
+    "只有任务需要操作工作区时才使用 bash；问候和简单问题直接回答。"
+    "使用最少行动，完成后停止。Windows 下使用 cmd.exe 命令。"
+)
+
 # ===== s01 新增：最小 bash 工具定义 =====
 
 TOOLS = [
     {
         "name": "bash",
-        "description": "Run a shell command in the current project directory.",
+        "description": "Run one shell command in the current project directory. On Windows, use cmd.exe syntax.",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -183,14 +200,18 @@ def main() -> None:
     if base_url := os.getenv("ANTHROPIC_BASE_URL"):
         client_options["base_url"] = base_url
     client = Anthropic(**client_options)
-    system = f"You are a coding agent working in {os.getcwd()}. Use bash to solve tasks."
-
     def create_message(**kwargs: Any) -> Any:
-        print(f"正在请求模型（超时 {timeout_seconds:g} 秒）...", flush=True)
+        print(format_model_request(timeout_seconds), flush=True)
         try:
             return client.messages.create(model=model, **kwargs)
         except Exception as error:
             raise RuntimeError(f"模型请求失败：{error}") from error
+
+    def execute_bash(command: str) -> str:
+        print(format_tool_call("bash", {"command": command}), flush=True)
+        output = run_bash(command)
+        print(format_tool_result(output), flush=True)
+        return output
 
     print("s01：核心循环")
     print("输入任务，输入 q 退出。\n")
@@ -198,7 +219,7 @@ def main() -> None:
     history: list[Message] = []
     while True:
         try:
-            query = input("s01 >> ").strip()
+            query = input(format_user_prompt("s01")).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -211,13 +232,13 @@ def main() -> None:
             agent_loop(
                 history,
                 create_message=create_message,
-                execute_tool=run_bash,
-                system=system,
+                execute_tool=execute_bash,
+                system=SYSTEM,
             )
         except RuntimeError as error:
-            print(f"\n{error}", file=sys.stderr)
+            print(f"\n{format_error(str(error))}", file=sys.stderr)
             continue
-        print(_text_from_content(history[-1]["content"]))
+        print(format_assistant_message(_text_from_content(history[-1]["content"])))
         print()
 
 
