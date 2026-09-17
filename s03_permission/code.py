@@ -219,6 +219,7 @@ class PermissionStatus(StrEnum):
     DENY = "deny"
 
 
+# s03 新增：用不可变结果统一表达允许、询问和拒绝，避免权限分支散落在工具函数中。
 @dataclass(frozen=True)
 class PermissionDecision:
     """描述权限状态及其面向用户的原因。"""
@@ -271,6 +272,7 @@ def check_permission(name: str, arguments: dict[str, Any]) -> PermissionDecision
     文件写入和编辑需要确认，bash 则根据命令规则进一步区分允许、询问和拒绝。
     这里是应用层策略，不替代操作系统沙箱；完整的工具生命周期拦截将在 s04 Hooks 实现。
     """
+    # s03 新增：权限判断先于 handler 查找和执行，未知工具默认拒绝。
     if name not in TOOL_HANDLERS:
         return PermissionDecision(PermissionStatus.DENY, f"未知工具：{name}")
 
@@ -280,8 +282,10 @@ def check_permission(name: str, arguments: dict[str, Any]) -> PermissionDecision
         except ValueError:
             return PermissionDecision(PermissionStatus.DENY, "路径超出工作区范围")
 
+    # s03 新增：只读工具自动放行，降低正常浏览工作区时的交互成本。
     if name in _READ_ONLY_TOOLS:
         return PermissionDecision(PermissionStatus.ALLOW, "只读工具")
+    # s03 新增：写入和编辑统一进入用户确认流程。
     if name in _WRITE_TOOLS:
         return PermissionDecision(PermissionStatus.ASK, "工具将修改工作区文件")
     if name == "bash":
@@ -331,6 +335,7 @@ def execute_tool(
     输入：工具名称、工具参数、实际分发函数，以及可替换的权限检查和确认函数。
     输出：工具结果文本；拒绝或取消确认也会转成结果文本返回给模型。
     """
+    # s03 新增：所有工具调用先经过可注入的权限函数，再决定是否执行。
     decision = permission(name, arguments)
     if decision.status is PermissionStatus.DENY:
         return f"Permission denied: {decision.reason}"
@@ -392,6 +397,7 @@ def agent_loop(
             name = _get(block, "name")
             arguments = _get(block, "input") or {}
             print(format_tool_call(name, arguments), flush=True)
+            # s03 修改：相对 s02，工具分发前增加权限检查和用户确认。
             output = execute_tool(
                 name,
                 arguments,

@@ -52,7 +52,9 @@ SYSTEM = (
 
 # ===== s04 新增：Hook 类型和容器 =====
 
+# s04 新增：前置 Hook 用返回值表达“继续”或“阻断”，不直接执行工具。
 BeforeToolHook = Callable[[str, dict[str, Any]], str | None]
+# s04 新增：后置 Hook 接收当前结果并返回处理后的结果，支持结果处理链。
 AfterToolHook = Callable[[str, dict[str, Any], str], str]
 
 
@@ -60,7 +62,9 @@ AfterToolHook = Callable[[str, dict[str, Any], str], str]
 class Hooks:
     """按工具调用生命周期保存前置和后置 Hook。"""
 
+    # s04 新增：前置 Hook 控制工具能否进入 dispatch。
     before_tool_call: list[BeforeToolHook] = field(default_factory=list)
+    # s04 新增：后置 Hook 统一处理工具执行或阻断后的结果。
     after_tool_call: list[AfterToolHook] = field(default_factory=list)
 
 

@@ -77,6 +77,7 @@ def run_bash(command: str) -> str:
 
 def safe_path(path: str) -> Path:
     """把相对路径解析到工作目录内，拒绝越界路径。"""
+    # s02 新增：文件工具统一限制在工作区，避免路径参数直接访问外部文件。
     resolved = (WORKDIR / path).resolve()
     if not resolved.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {path}")
@@ -138,6 +139,7 @@ def run_glob(pattern: str) -> str:
 
 # ===== s02 新增：工具定义 =====
 
+# s02 新增：把 s01 的单个 bash 工具扩展为模型可选择的五个工具。
 TOOLS = [
     {
         "name": "bash",
@@ -198,6 +200,7 @@ TOOLS = [
 
 # ===== s02 新增：工具注册表 =====
 
+# s02 新增：用名称到处理函数的映射替代核心循环中的工具分支，便于继续扩展工具。
 TOOL_HANDLERS: dict[str, ToolHandler] = {
     "bash": run_bash,
     "read_file": run_read,
@@ -211,6 +214,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
     """根据工具名查找处理函数，并把模型参数传给它。"""
+    # s02 新增：统一从注册表查找 handler，让 agent_loop 不依赖具体工具实现。
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return f"Error: unknown tool: {name}"
@@ -285,6 +289,7 @@ def agent_loop(
             name = _get(block, "name")
             arguments = _get(block, "input") or {}
             print(format_tool_call(name, arguments), flush=True)
+            # s02 修改：相对 s01，工具执行从固定 bash 改为名称和参数分发。
             output = dispatch(name, arguments)
             print(format_tool_result(output), flush=True)
             results.append(
