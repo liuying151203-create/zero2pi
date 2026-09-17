@@ -367,9 +367,13 @@ def main() -> None:
         except Exception as error:
             raise RuntimeError(f"模型请求失败：{error}") from error
 
+    # s05 新增：允许通过环境变量切换会话文件，默认使用项目内的运行时目录。
     session_path = Path(os.getenv("SESSION_FILE", ".sessions/default.jsonl"))
+    # s05 新增：通过 SessionManager 隔离终端入口与 JSONL 存储实现。
     session = SessionManager.open(session_path)
+    # s05 新增：启动时恢复历史消息，后续请求会把它作为上下文发送给模型。
     history = session.load_messages()
+    # 来自 s04：保持；s05 复用 s04 的权限 Hook，不在会话章节重复实现。
     hooks = Hooks(before_tool_call=[previous.make_permission_hook()])
 
     print("s05：会话持久化")
