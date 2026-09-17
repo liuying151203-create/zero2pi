@@ -4,10 +4,15 @@
 
 ## 基础环境
 
+下面的命令分别用于创建虚拟环境、安装项目依赖，以及创建本地配置文件：
+
 ```powershell
+# 创建项目独立的 Python 虚拟环境
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+# 安装项目依赖和开发工具
 python -m pip install -e ".[dev]"
+# 创建本地环境变量文件
 Copy-Item .env.example .env
 ```
 
