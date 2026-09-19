@@ -45,6 +45,26 @@ def test_store_reports_corrupted_line_number(tmp_path) -> None:
         chapter.JsonlSessionStore(path).read_all()
 
 
+def test_session_repository_creates_and_resumes_sessions(tmp_path) -> None:
+    repository = chapter.SessionRepository(tmp_path)
+    first = repository.create_session("first")
+    first.append_message({"role": "user", "content": "one"})
+    second = repository.create_session("second")
+    second.append_message({"role": "user", "content": "two"})
+
+    paths = repository.list_sessions()
+    assert [path.name for path in paths] == ["first.jsonl", "second.jsonl"]
+    assert repository.open_session("1").load_messages()[0]["content"] == "one"
+    assert repository.open_session("second").load_messages()[0]["content"] == "two"
+
+
+def test_session_repository_rejects_invalid_selector(tmp_path) -> None:
+    repository = chapter.SessionRepository(tmp_path)
+
+    with pytest.raises(ValueError, match="不能包含目录路径"):
+        repository.open_session("../outside")
+
+
 def test_agent_loop_persists_assistant_and_tool_messages() -> None:
     responses = [
         SimpleNamespace(

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -191,7 +192,8 @@ class SessionManager:
     作用：隔离 Agent loop 与具体文件格式，让核心循环只需要一个“保存消息”的函数，
     终端入口则通过管理器恢复历史并追加新消息。
 
-    当前管理器只支持单文件、线性会话；分支、父子节点和上下文压缩留到后续章节。
+    当前管理器表示一个活动的、线性的会话文件；多个会话的创建和选择由
+    `SessionRepository` 负责，分支、父子节点和上下文压缩留到后续章节。
     """
 
     def __init__(self, store: JsonlSessionStore) -> None:
@@ -225,6 +227,90 @@ class SessionManager:
         输出：无；转换和写入由 `SessionMessage` 与 `JsonlSessionStore` 完成。
         """
         self.store.append(SessionMessage.from_message(message))
+
+
+# ===== s05 新增：会话目录管理 =====
+
+class SessionRepository:
+    """管理会话目录中的多个线性 JSONL 会话。
+
+    作用：在 `SessionManager` 之上提供创建、列出和打开会话的能力，隔离终端命令
+    与具体文件名规则。一个 Repository 对应一个会话目录，但同一时间只由入口选中
+    一个当前 `SessionManager`。
+
+    输入：会话目录路径。
+    输出：会话路径列表，或指向指定会话的 `SessionManager`。
+    边界：当前只支持独立的线性文件，不处理会话分支、树结构和跨文件合并。
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    # s05 新增：列出当前会话目录中的独立 JSONL 文件。
+    def list_sessions(self) -> list[Path]:
+        """按文件名排序返回会话目录中的 JSONL 文件。"""
+        if not self.root.exists():
+            return []
+        return sorted(path for path in self.root.glob("*.jsonl") if path.is_file())
+
+    # s05 新增：创建空会话文件，并返回可继续追加消息的管理器。
+    def create_session(self, name: str | None = None) -> SessionManager:
+        """创建一个新的空会话并返回对应的管理器。
+
+        输入：可选会话名；名称会被限制为当前目录下的安全文件名。
+        输出：新建文件对应的 `SessionManager`。未提供名称时使用时间戳生成文件名，
+        文件冲突时追加序号。
+        """
+        self.root.mkdir(parents=True, exist_ok=True)
+        stem = self._safe_stem(name) if name else datetime.now(UTC).strftime(
+            "session-%Y%m%d-%H%M%S"
+        )
+        path = self.root / f"{stem}.jsonl"
+        suffix = 2
+        while path.exists():
+            path = self.root / f"{stem}-{suffix}.jsonl"
+            suffix += 1
+        path.touch()
+        return SessionManager.open(path)
+
+    # s05 新增：把用户输入的序号或文件名解析为一个已有会话。
+    def open_session(self, selector: str) -> SessionManager:
+        """按序号或文件名打开一个已有会话。
+
+        输入：`/sessions` 显示的 1-based 序号，或会话文件名/不带扩展名的文件名。
+        输出：指向目标文件的 `SessionManager`。
+        异常：选择器为空、包含目录穿越、序号不存在或文件不存在时抛出 `ValueError`。
+        """
+        selector = selector.strip()
+        paths = self.list_sessions()
+        if not selector:
+            raise ValueError("请输入会话序号或文件名")
+        if selector.isdigit():
+            index = int(selector) - 1
+            if index < 0 or index >= len(paths):
+                raise ValueError(f"会话序号不存在：{selector}")
+            return SessionManager.open(paths[index])
+
+        candidate = Path(selector)
+        if candidate.name != selector:
+            raise ValueError("会话选择器不能包含目录路径")
+        if candidate.suffix != ".jsonl":
+            candidate = candidate.with_suffix(".jsonl")
+        path = self.root / candidate.name
+        if not path.is_file():
+            raise ValueError(f"会话不存在：{selector}")
+        return SessionManager.open(path)
+
+    # s05 新增：统一清理自定义会话名，避免把目录路径当作文件名使用。
+    @staticmethod
+    def _safe_stem(name: str) -> str:
+        """把用户输入的会话名转换为安全的文件名主体。"""
+        if Path(name).name != name:
+            raise ValueError("会话名不能包含目录路径")
+        stem = re.sub(r"[^\w-]+", "-", Path(name).stem).strip("-_")
+        if not stem:
+            raise ValueError("会话名不能为空")
+        return stem
 
 
 SessionSaver = Callable[[Message], None]
@@ -334,14 +420,47 @@ def _text_from_content(content: Any) -> str:
     )
 
 
+def show_sessions(repository: SessionRepository, current: SessionManager) -> None:
+    """在终端显示会话序号、文件名、消息数量和当前标记。
+
+    输入：会话目录管理器和当前活动会话。
+    输出：无；直接打印可供 `/resume` 使用的会话列表。
+    读取单个会话失败时只显示错误状态，不影响其他会话继续列出。
+    """
+    paths = repository.list_sessions()
+    if not paths:
+        print("暂无历史会话。")
+        return
+
+    current_path = current.path.resolve()
+    for index, path in enumerate(paths, start=1):
+        marker = "*" if path.resolve() == current_path else " "
+        try:
+            count = len(SessionManager.open(path).load_messages())
+            detail = f"{count} 条消息"
+        except ValueError as error:
+            detail = f"读取失败：{error}"
+        print(f"{marker} {index}. {path.name}（{detail}）")
+
+
+def print_session_help() -> None:
+    """打印 s05 支持的会话命令。"""
+    print("/new [name]  创建新会话")
+    print("/sessions    查看历史会话")
+    print("/resume N    继续第 N 个会话")
+    print("/help        查看命令帮助")
+    print("/exit        退出程序")
+
+
 # ===== s05 修改：终端入口接入会话管理 =====
 
 def main() -> None:
     """启动带线性会话持久化的 Agent。
 
     作用：加载模型配置，打开会话文件，恢复历史消息，并把新消息持续写入 JSONL。
-    输入：用户在终端输入的自然语言任务；`SESSION_FILE` 可选地指定会话文件路径。
-    输出：恢复提示、工具调用、工具结果和模型回答；空行、`q` 或 `exit` 退出。
+    输入：用户在终端输入的自然语言任务或会话命令；`SESSION_FILE` 可选地指定初始会话路径。
+    输出：会话列表、恢复提示、工具调用、工具结果和模型回答；空行、`q` 或 `exit` 退出。
+    会话命令：`/new` 创建、`/sessions` 查看、`/resume` 恢复、`/help` 帮助。
     """
     load_dotenv(override=True)
     model = os.getenv("MODEL_ID")
@@ -372,6 +491,8 @@ def main() -> None:
     session_path = Path(os.getenv("SESSION_FILE", ".sessions/default.jsonl"))
     # s05 新增：通过 SessionManager 隔离终端入口与 JSONL 存储实现。
     session = SessionManager.open(session_path)
+    # s05 新增：会话仓库负责多个 JSONL 文件的创建、列出和切换。
+    repository = SessionRepository(session.path.parent)
     # s05 新增：启动时恢复历史消息，后续请求会把它作为上下文发送给模型。
     history = session.load_messages()
     # 来自 s04：保持；s05 复用 s04 的权限 Hook，不在会话章节重复实现。
@@ -381,7 +502,7 @@ def main() -> None:
     print(f"会话文件：{session.path}")
     if history:
         print(f"已恢复 {len(history)} 条消息。")
-    print("输入任务，输入 q 退出。\n")
+    print("输入任务，输入 q 退出；输入 /help 查看会话命令。\n")
 
     while True:
         try:
@@ -392,6 +513,41 @@ def main() -> None:
 
         if query.lower() in {"", "q", "exit"}:
             return
+
+        # s05 新增：在自然语言任务之外解析会话管理命令。
+        command, _, argument = query.partition(" ")
+        if command == "/new":
+            # s05 新增：创建会话并将当前内存历史切换为空列表。
+            try:
+                session = repository.create_session(argument or None)
+                history = session.load_messages()
+                print(f"已创建新会话：{session.path}\n")
+            except ValueError as error:
+                print(format_error(str(error)))
+            continue
+        if command == "/sessions":
+            # s05 新增：展示会话序号，供 /resume 选择。
+            show_sessions(repository, session)
+            print()
+            continue
+        if command == "/resume":
+            # s05 新增：打开目标会话并替换当前消息历史。
+            try:
+                session = repository.open_session(argument)
+                history = session.load_messages()
+                print(f"已切换会话：{session.path}（{len(history)} 条消息）\n")
+            except ValueError as error:
+                print(format_error(str(error)))
+            continue
+        if command == "/help":
+            print_session_help()
+            print()
+            continue
+        if command == "/exit":
+            return
+        if command.startswith("/"):
+            print(format_error(f"未知命令：{command}，输入 /help 查看帮助"))
+            continue
 
         user_message = {"role": "user", "content": query}
         # s05 新增：用户消息在请求模型前落盘，保证中断后也能恢复输入。

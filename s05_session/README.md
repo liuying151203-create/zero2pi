@@ -34,11 +34,13 @@ Message → SessionMessage → JsonlSessionStore → SessionManager
 | 消息模型 | `SessionMessage` | 在 Agent 消息和 JSONL 记录之间转换 |
 | 存储层 | `JsonlSessionStore` | 只负责文件追加写入和顺序读取 |
 | 管理层 | `SessionManager` | 对外提供打开、加载和追加消息的接口 |
+| 会话目录 | `SessionRepository` | 创建、列出和按序号/文件名打开多个会话 |
 
 辅助方法的关系：
 
 - `_to_jsonable()`：把 Anthropic SDK 对象转换成普通 JSON 值，供 `SessionMessage` 使用；
 - `_append_message()`：同时更新内存 `messages` 和持久化存储，避免两边写法不一致；
+- `SessionRepository`：管理多个会话文件，`SessionManager` 只代表当前选中的一个会话；
 - `agent_loop()`：在 assistant 和 tool_result 消息产生时调用保存函数；
 - `main()`：创建 `SessionManager`，启动时加载历史，并把 `session.append_message` 注入 `agent_loop()`。
 
@@ -49,6 +51,8 @@ main()
     ├─ SessionManager.open()
     ├─ SessionManager.load_messages()
     │      └─ JsonlSessionStore.read_all()
+    ├─ /new、/sessions、/resume
+    │      └─ SessionRepository
     └─ agent_loop(save_message=session.append_message)
            └─ _append_message()
                   ├─ 更新内存 messages
@@ -68,8 +72,18 @@ python -m s05_session.code
 
 从项目根目录使用 `-m` 运行，确保章节之间的兄弟模块可以正常导入。退出后再次运行，程序会继续读取同一个会话文件。也可以通过 `SESSION_FILE` 环境变量指定其他 JSONL 文件。
 
+运行后可使用：
+
+```text
+/new [name]  创建新会话
+/sessions    查看历史会话
+/resume N    继续第 N 个会话
+/help        查看命令帮助
+/exit        退出程序
+```
+
 ## 参考与差异
 
 - `lcc` 的 memory 同时处理长期存储、相关召回、自动提取和记忆整理，目的是让跨会话知识可以被选择性复用；本章先拆出更基础的会话持久化，避免把“对话记录”和“长期语义记忆”混在一起。
-- `pi` 的 session 设计强调追加式记录和从持久化状态重建当前上下文。本章保留这个方向，但先使用线性 JSONL，不引入 `parentId`、分支树和复杂事件类型；后续会话运行时章节（编号待定）再实现分支与压缩。
+- `pi` 的 session 设计强调追加式记录和从持久化状态重建当前上下文。本章保留这个方向，并增加 `SessionRepository` 管理多个线性 JSONL 文件，但先不引入 `parentId`、分支树和复杂事件类型；后续会话运行时章节（编号待定）再实现分支与压缩。
 - s04 的 Hooks 继续负责工具生命周期，s05 只在消息产生时注入保存函数；上下文预算与压缩将在后续章节（编号待定），显式长期记忆和自动召回再另行实现。
