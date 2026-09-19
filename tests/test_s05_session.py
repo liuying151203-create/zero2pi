@@ -45,24 +45,36 @@ def test_store_reports_corrupted_line_number(tmp_path) -> None:
         chapter.JsonlSessionStore(path).read_all()
 
 
-def test_session_repository_creates_and_resumes_sessions(tmp_path) -> None:
-    repository = chapter.SessionRepository(tmp_path)
-    first = repository.create_session("first")
-    first.append_message({"role": "user", "content": "one"})
-    second = repository.create_session("second")
-    second.append_message({"role": "user", "content": "two"})
+def test_session_path_from_cli_creates_distinct_new_sessions(tmp_path) -> None:
+    first = chapter.session_path_from_cli([], session_root=tmp_path)
+    second = chapter.session_path_from_cli([], session_root=tmp_path)
 
-    paths = repository.list_sessions()
-    assert [path.name for path in paths] == ["first.jsonl", "second.jsonl"]
-    assert repository.open_session("1").load_messages()[0]["content"] == "one"
-    assert repository.open_session("second").load_messages()[0]["content"] == "two"
+    assert first.is_file()
+    assert second.is_file()
+    assert first != second
+    assert first.parent == tmp_path
 
 
-def test_session_repository_rejects_invalid_selector(tmp_path) -> None:
-    repository = chapter.SessionRepository(tmp_path)
+def test_session_path_from_cli_loads_explicit_history(tmp_path) -> None:
+    history_path = tmp_path / "history.jsonl"
+    history_path.write_text(
+        '{"type":"message","role":"user","content":"继续"}\n',
+        encoding="utf-8",
+    )
 
-    with pytest.raises(ValueError, match="不能包含目录路径"):
-        repository.open_session("../outside")
+    selected = chapter.session_path_from_cli(["--session", str(history_path)])
+
+    assert selected == history_path
+    assert chapter.SessionManager.open(selected).load_messages() == [
+        {"role": "user", "content": "继续"}
+    ]
+
+
+def test_session_path_from_cli_rejects_missing_history(tmp_path) -> None:
+    missing_path = tmp_path / "missing.jsonl"
+
+    with pytest.raises(ValueError, match="会话文件不存在"):
+        chapter.session_path_from_cli(["--session", str(missing_path)])
 
 
 def test_agent_loop_persists_assistant_and_tool_messages() -> None:

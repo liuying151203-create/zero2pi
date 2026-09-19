@@ -31,6 +31,8 @@ python -m s03_permission.code
 python -m s04_hooks.code
 # 运行第五章：会话持久化
 python -m s05_session.code
+# 加载已有的第五章会话
+python -m s05_session.code --session .sessions\session-20260919-120000.jsonl
 # 运行测试
 python -m pytest
 # 检查代码规范
