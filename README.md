@@ -33,8 +33,12 @@ python -m s04_hooks.code
 python -m s05_session.code
 # 加载已有的第五章会话
 python -m s05_session.code --session .sessions\session-20260919-120000.jsonl
+# 运行第六章：会话上下文投影
+python -m s06_session_context.code
+# 加载已有会话并按 s06 Entry 规则构建模型上下文
+python -m s06_session_context.code --session .sessions\session-20260919-120000.jsonl
 # 运行测试
 python -m pytest
 # 检查代码规范
-ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session src tests
+ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session s06_session_context src tests
 ```
