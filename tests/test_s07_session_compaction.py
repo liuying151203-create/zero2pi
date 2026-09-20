@@ -1,0 +1,168 @@
+from types import SimpleNamespace
+
+import s07_session_compaction.code as chapter
+
+
+def _message(role: str, content: object) -> chapter.Message:
+    return {"role": role, "content": content}
+
+
+def test_store_round_trips_message_and_compaction_entries(tmp_path) -> None:
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    tail = _message("user", "保留的最新任务")
+
+    session.append_message(_message("user", "较早任务"))
+    session.append_compaction("已完成早期调查。", [tail])
+
+    entries = session.load_entries()
+
+    assert [type(entry) for entry in entries] == [chapter.MessageEntry, chapter.CompactionEntry]
+    compaction = entries[1]
+    assert isinstance(compaction, chapter.CompactionEntry)
+    assert compaction.summary == "已完成早期调查。"
+    assert list(compaction.retained_tail) == [tail]
+
+
+def test_context_uses_only_latest_compaction_and_later_messages() -> None:
+    old = chapter.MessageEntry.from_message(_message("user", "不应进入模型上下文的旧消息"))
+    tail = chapter.MessageEntry.from_message(_message("assistant", "保留的最近回答"))
+    compaction = chapter.CompactionEntry.create("旧消息摘要", [tail.message])
+    later = chapter.MessageEntry.from_message(_message("user", "压缩后的新任务"))
+
+    context = chapter.build_session_context([old, tail, compaction, later])
+
+    assert context == [
+        _message("user", "[会话摘要]\n旧消息摘要"),
+        tail.message,
+        later.message,
+    ]
+
+
+def test_compactor_persists_summary_and_recent_tail(tmp_path) -> None:
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    for index in range(5):
+        session.append_message(_message("user", f"第 {index} 条消息，包含足够长的内容。"))
+
+    summarized: list[list[chapter.Message]] = []
+
+    def summarize(messages):
+        summarized.append(list(messages))
+        return "已总结较早的三条消息。"
+
+    compactor = chapter.ContextCompactor(
+        session,
+        chapter.CompactionPolicy(max_context_chars=80, keep_recent_messages=2),
+        summarize,
+    )
+
+    assert compactor.compact_if_needed() == "model"
+    assert [message["content"] for message in summarized[0]] == [
+        "第 0 条消息，包含足够长的内容。",
+        "第 1 条消息，包含足够长的内容。",
+        "第 2 条消息，包含足够长的内容。",
+    ]
+    assert [message["content"] for message in session.build_context()] == [
+        "[会话摘要]\n已总结较早的三条消息。",
+        "第 3 条消息，包含足够长的内容。",
+        "第 4 条消息，包含足够长的内容。",
+    ]
+    assert isinstance(session.load_entries()[-1], chapter.CompactionEntry)
+
+
+def test_compactor_keeps_tool_use_and_result_together() -> None:
+    messages = [
+        _message("user", "较早任务"),
+        _message(
+            "assistant",
+            [{"type": "tool_use", "id": "tool-1", "name": "read_file", "input": {}}],
+        ),
+        _message("user", [{"type": "tool_result", "tool_use_id": "tool-1", "content": "内容"}]),
+    ]
+
+    summary_source, retained_tail = chapter.split_context_for_compaction(messages, 1)
+
+    assert summary_source == [messages[0]]
+    assert retained_tail == messages[1:]
+
+
+def test_request_wrapper_compacts_then_uses_latest_context(tmp_path) -> None:
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    session.append_message(_message("user", "第一条需要压缩的内容"))
+    session.append_message(_message("user", "第二条需要保留的内容"))
+    requested_contexts: list[list[chapter.Message]] = []
+
+    def create_message(**kwargs):
+        requested_contexts.append(kwargs["messages"])
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text="ok")])
+
+    compactor = chapter.ContextCompactor(
+        session,
+        chapter.CompactionPolicy(max_context_chars=20, keep_recent_messages=1),
+        lambda messages: "第一条摘要",
+    )
+    chapter.request_with_compacted_context(
+        create_message,
+        session,
+        compactor,
+        messages=[_message("user", "不应使用这条内存消息")],
+    )
+
+    assert requested_contexts == [
+        [
+            _message("user", "[会话摘要]\n第一条摘要"),
+            _message("user", "第二条需要保留的内容"),
+        ]
+    ]
+
+
+def test_compactor_uses_safe_fallback_when_summary_is_unavailable(tmp_path) -> None:
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    session.append_message(_message("user", "较早任务"))
+    session.append_message(_message("user", "最新任务"))
+    compactor = chapter.ContextCompactor(
+        session,
+        chapter.CompactionPolicy(max_context_chars=10, keep_recent_messages=1),
+        lambda messages: None,
+    )
+
+    assert compactor.compact_if_needed() == "fallback"
+    context = session.build_context()
+    assert str(session.path) in str(context[0]["content"])
+    assert context[1] == _message("user", "最新任务")
+
+
+def test_context_summarizer_uses_a_separate_tool_free_request() -> None:
+    requests: list[dict[str, object]] = []
+
+    def create_message(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text="摘要结果")])
+
+    assert chapter.summarize_context(
+        [_message("user", "原始任务")],
+        create_message,
+        max_tokens=300,
+    ) == "摘要结果"
+    assert requests[0]["system"] == chapter.COMPACTION_SYSTEM
+    assert requests[0]["tools"] == []
+    assert requests[0]["max_tokens"] == 300
+    assert "原始任务" in str(requests[0]["messages"])
+
+
+def test_context_summarizer_retries_with_more_tokens_for_thinking_only_response() -> None:
+    requests: list[dict[str, object]] = []
+    responses = [
+        SimpleNamespace(content=[SimpleNamespace(type="thinking", thinking="正在整理")]),
+        SimpleNamespace(content=[SimpleNamespace(type="text", text="重试后的摘要")]),
+    ]
+
+    def create_message(**kwargs):
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    assert chapter.summarize_context(
+        [_message("user", "原始任务")],
+        create_message,
+        max_tokens=300,
+    ) == "重试后的摘要"
+    assert [request["max_tokens"] for request in requests] == [300, 1024]

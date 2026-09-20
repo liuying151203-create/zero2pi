@@ -37,8 +37,12 @@ python -m s05_session_persistence.code --session .sessions\s05\session-20260919-
 python -m s06_session_context.code
 # 加载已有会话并按 s06 Entry 规则构建模型上下文
 python -m s06_session_context.code --session .sessions\s06\session-20260919-120000.jsonl
+# 运行第七章：会话系统 · 上下文压缩
+python -m s07_session_compaction.code
+# 加载已有的第七章会话
+python -m s07_session_compaction.code --session .sessions\s07\session-20260919-120000.jsonl
 # 运行测试
 python -m pytest
 # 检查代码规范
-ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session_persistence s06_session_context src tests
+ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session_persistence s06_session_context s07_session_compaction src tests
 ```
