@@ -1,6 +1,13 @@
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import s06_session_context.code as chapter
+
+
+def test_default_session_root_is_scoped_to_s06() -> None:
+    assert chapter.SESSION_ROOT == Path(".sessions/s06")
 
 
 def test_store_round_trips_message_entries(tmp_path) -> None:
@@ -16,16 +23,16 @@ def test_store_round_trips_message_entries(tmp_path) -> None:
     assert [entry.message["role"] for entry in entries] == ["user", "assistant"]
 
 
-def test_store_reads_s05_message_record_for_compatible_resume(tmp_path) -> None:
+def test_store_rejects_s05_flat_message_record(tmp_path) -> None:
     path = tmp_path / "s05-session.jsonl"
     path.write_text(
         '{"type":"message","role":"user","content":"继续之前的任务"}\n',
         encoding="utf-8",
     )
 
-    context = chapter.SessionManager.open(path).build_context()
+    with pytest.raises(ValueError, match="无效会话记录"):
+        chapter.SessionManager.open(path).build_context()
 
-    assert context == [{"role": "user", "content": "继续之前的任务"}]
 
 
 def test_build_context_creates_a_separate_message_list() -> None:

@@ -31,6 +31,9 @@ from zero2pi.ui import (
     format_user_prompt,
 )
 
+# s06 修改：使用独立目录，避免 s06 的嵌套 Record 与 s05 的扁平 Record 混在同一位置。
+SESSION_ROOT = Path(".sessions/s06")
+
 # ===== 来自 s05：Agent 运行时依赖（保持） =====
 # s06 只改变会话日志到模型上下文的转换边界，工具、Hooks 和核心循环继续复用 s05。
 Message = previous.Message
@@ -90,8 +93,9 @@ class MessageEntry:
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> MessageEntry:
-        """兼容读取 s05 旧格式和 s06 新格式的消息记录。"""
-        raw_message = record.get("message", record)
+        """读取 s06 嵌套消息 Record。"""
+        # s06 修改：章节目录隔离后不再兼容 s05 的扁平 Record，只接受自身格式。
+        raw_message = record.get("message")
         return cls(
             message=_message_from_record(raw_message),
             timestamp=str(record.get("timestamp", "")),
@@ -279,8 +283,10 @@ def main(arguments: Sequence[str] | None = None) -> None:
         except Exception as error:
             raise RuntimeError(f"模型请求失败：{error}") from error
 
-    # 来自 s05：保持；继续使用启动参数决定新会话或指定历史会话。
-    session = SessionManager.open(previous.session_path_from_cli(arguments))
+    # s06 修改：复用 s05 的启动参数解析，但指定 s06 专属默认目录以隔离存储格式。
+    session = SessionManager.open(
+        previous.session_path_from_cli(arguments, session_root=SESSION_ROOT)
+    )
     # s06 修改：模型不直接加载全部记录，而是从 Entry 日志投影活跃上下文。
     initial_context = session.build_context()
     # s06 新增：以函数注入方式在每次请求前重新构建上下文，贴近 Pi 的投影边界。

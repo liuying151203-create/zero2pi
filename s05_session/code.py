@@ -33,6 +33,9 @@ from zero2pi.ui import (
     format_user_prompt,
 )
 
+# s05 修改：默认会话目录按章节隔离，避免与其他章节的 JSONL 格式混用。
+DEFAULT_SESSION_ROOT = Path(".sessions/s05")
+
 # ===== 来自 s04：工具、Hooks 和消息类型（复用） =====
 # s05 只新增会话边界，不重复实现 s04 已验证的工具权限和生命周期逻辑。
 
@@ -246,13 +249,13 @@ def _create_new_session_path(root: Path) -> Path:
 def session_path_from_cli(
     arguments: Sequence[str] | None = None,
     *,
-    session_root: Path = Path(".sessions"),
+    session_root: Path = DEFAULT_SESSION_ROOT,
 ) -> Path:
     """根据启动参数创建新会话，或加载指定的历史会话。
 
     作用：把会话选择限制在程序启动阶段，避免终端输入循环承担会话管理职责。
     输入：可选的命令行参数；支持 `--session <路径>`。未传入该参数时在
-    `session_root` 创建新的时间戳 JSONL 文件。
+    `session_root`（默认 `.sessions/s05/`）创建新的时间戳 JSONL 文件。
     输出：当前运行唯一使用的会话文件路径；指定路径不存在时抛出 `ValueError`。
     流程：解析命令行参数 → 校验指定历史文件，或创建新文件 → 返回会话路径。
     """

@@ -80,11 +80,11 @@ flowchart TD
 # 创建新会话；启动后会打印实际文件路径
 python -m s06_session_context.code
 
-# 加载已有的 s05 或 s06 会话
-python -m s06_session_context.code --session .sessions\session-20260919-120000.jsonl
+# 加载已有的 s06 会话
+python -m s06_session_context.code --session .sessions\s06\session-20260919-120000.jsonl
 ```
 
-s06 可以读取 s05 的扁平 `message` Record，也会把新的消息写为嵌套的 s06 Record。s05 不认识这个新格式，因此升级后应继续使用 s06 打开该文件。
+s06 只读取并写入自身的嵌套 `message` Record；默认会话目录为 `.sessions/s06/`，与 s05 的 `.sessions/s05/` 隔离。
 
 ## 参考与差异
 

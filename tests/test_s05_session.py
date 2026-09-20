@@ -1,8 +1,13 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import s05_session.code as chapter
+
+
+def test_default_session_root_is_scoped_to_s05() -> None:
+    assert chapter.DEFAULT_SESSION_ROOT == Path(".sessions/s05")
 
 
 def test_session_store_round_trips_unicode_and_tool_blocks(tmp_path) -> None:

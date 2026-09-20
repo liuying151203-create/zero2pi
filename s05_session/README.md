@@ -40,10 +40,10 @@ Message → SessionMessage → JsonlSessionStore → SessionManager → agent_lo
 python -m s05_session.code
 
 # 加载一个已有的历史会话
-python -m s05_session.code --session .sessions\session-20260919-120000.jsonl
+python -m s05_session.code --session .sessions\s05\session-20260919-120000.jsonl
 ```
 
-从项目根目录使用 `-m` 运行，以保证章节之间的兄弟模块可以正常导入。默认会话保存在 `.sessions/`；`--session` 指向的文件必须已经存在。
+从项目根目录使用 `-m` 运行，以保证章节之间的兄弟模块可以正常导入。默认会话保存在 `.sessions/s05/`；`--session` 指向的文件必须已经存在。
 
 ## 参考与差异
 
