@@ -6,7 +6,6 @@
     Message -> SessionMessage -> JsonlSessionStore -> SessionManager
 
 默认启动会创建新会话；使用 `--session <路径>` 才会恢复指定的历史会话。
-暂不引入分支会话、上下文压缩和长期语义记忆。
 """
 
 from __future__ import annotations
@@ -85,7 +84,7 @@ class SessionMessage:
         content：文本或结构化内容块，写入前会转换为 JSON 基础值。
         timestamp：消息写入时的 UTC 时间戳，用于观察记录顺序和调试。
 
-    该模型只描述线性会话中的消息，不包含 Pi 后续会话树所需的 parentId、分支和事件类型。
+    该模型只描述线性会话中的一条消息。
     """
 
     role: str
@@ -141,8 +140,8 @@ class SessionMessage:
 class JsonlSessionStore:
     """负责会话 JSONL 文件的追加写入和顺序读取。
 
-    该层只关心文件格式和 I/O，不决定会话如何参与 Agent loop，也不实现分支或检索。
-    每次追加一行，读取时按文件顺序恢复消息；这种结构便于后续扩展为追加式事件日志。
+    该层只关心文件格式和 I/O，不决定会话如何参与 Agent loop。
+    每次追加一行，读取时按文件顺序恢复消息。
     """
 
     def __init__(self, path: Path) -> None:
@@ -193,8 +192,7 @@ class SessionManager:
     作用：隔离 Agent loop 与具体文件格式，让核心循环只需要一个“保存消息”的函数，
     终端入口则通过管理器恢复历史并追加新消息。
 
-    当前管理器表示一个活动的、线性的会话文件；会话由终端启动参数选定，
-    分支、会话列表、父子节点和上下文压缩留到后续章节。
+    当前管理器表示一个由终端启动参数选定的线性会话文件。
     """
 
     def __init__(self, store: JsonlSessionStore) -> None:
@@ -421,7 +419,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     session_path = session_path_from_cli(arguments)
     # s05 新增：通过 SessionManager 隔离终端入口与 JSONL 存储实现。
     session = SessionManager.open(session_path)
-    # s05 新增：启动时恢复历史消息，后续请求会把它作为上下文发送给模型。
+    # s05 新增：启动时恢复历史消息，并将其作为模型请求上下文。
     history = session.load_messages()
     # 来自 s04：保持；s05 复用 s04 的权限 Hook，不在会话章节重复实现。
     hooks = Hooks(before_tool_call=[previous.make_permission_hook()])

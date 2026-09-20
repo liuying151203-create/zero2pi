@@ -6,7 +6,7 @@
     完整 SessionEntry 日志 -> build_session_context() -> 模型 messages
 
 日志会保留 message、compaction 和 custom 三种 Entry；当前章节只实现投影，
-不自动创建 compaction。s07 将生成并写入 compaction checkpoint。
+不自动创建 compaction。
 """
 
 from __future__ import annotations
@@ -114,10 +114,10 @@ class CompactionEntry:
     作用：保存历史摘要和仍需原样发送给模型的最近消息；完整旧消息不会从 JSONL 删除。
     输入：摘要文本、保留尾部消息和可选时间戳。
     输出：投影时生成“摘要消息 + 保留尾部”的上下文起点。
-    边界：本章定义该记录和投影规则，s07 才负责调用模型生成摘要。
+    边界：该对象只表示已经存在的 checkpoint；本章不负责生成摘要文本。
     """
 
-    # s06 新增：摘要和保留尾部将由 s07 写入，s06 先定义其可恢复的 checkpoint 载体。
+    # s06 新增：摘要与保留尾部组成一个可恢复的 checkpoint 载体。
     summary: str
     retained_tail: list[Message]
     timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -151,12 +151,12 @@ class CompactionEntry:
 class CustomEntry:
     """记录不直接属于模型对话的扩展状态。
 
-    作用：为后续任务状态、Skill 等能力预留追加式存储位置。
+    作用：保存不直接属于模型对话的扩展状态。
     输入：扩展类型、JSON 数据和可选时间戳。
     输出：默认不投影到模型的 Session Entry。
     """
 
-    # s06 新增：扩展状态与模型消息分离，为后续 projector 留出不污染 Agent loop 的存储位置。
+    # s06 新增：扩展状态与模型消息分离，避免非对话数据污染 Agent loop。
     custom_type: str
     data: Any = None
     timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -330,7 +330,7 @@ class SessionManager:
 
     def build_context(self) -> list[Message]:
         """读取完整日志并构造当前模型上下文。"""
-        # s06 新增：统一由投影规则产生模型输入，后续 compaction 不需要改动 Agent loop。
+    # s06 新增：统一由投影规则产生模型输入，使 Session 与 Agent loop 保持隔离。
         return build_session_context(self.load_entries())
 
     def append_message(self, message: Message) -> None:
@@ -339,8 +339,8 @@ class SessionManager:
         self.store.append(MessageEntry.from_message(message))
 
     def append_compaction(self, summary: str, retained_tail: Sequence[Message]) -> None:
-        """追加 checkpoint；s07 将在生成摘要成功后调用此接口。"""
-        # s06 新增：提供 checkpoint 写入边界，但本章运行时不会主动调用它。
+        """将已准备好的摘要和保留尾部追加为 checkpoint。"""
+        # s06 新增：checkpoint 作为完整日志的一条事实记录，与原始消息并存。
         self.store.append(
             CompactionEntry(
                 summary=summary,
@@ -350,7 +350,7 @@ class SessionManager:
 
     def append_custom(self, custom_type: str, data: Any = None) -> None:
         """追加默认不参与模型上下文的扩展记录。"""
-        # s06 新增：提供扩展状态落盘接口，具体投影规则留给后续章节。
+        # s06 新增：扩展数据会被持久化，但当前投影规则默认忽略它。
         self.store.append(CustomEntry(custom_type=custom_type, data=data))
 
 

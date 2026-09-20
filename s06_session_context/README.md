@@ -1,6 +1,6 @@
 # s06：会话上下文投影
 
-s05 把 JSONL 中的全部消息直接作为模型上下文；s06 改为保存完整 Session Entry 日志，并在每次模型请求前投影出当前活跃上下文。这是后续 Pi 风格 compaction checkpoint 的基础。
+s05 把 JSONL 中的全部消息直接作为模型上下文；s06 改为保存完整 Session Entry 日志，并在每次模型请求前投影出当前活跃上下文。
 
 ## 先统一术语
 
@@ -82,7 +82,7 @@ flowchart TD
 | `SessionManager.load_entries()` | 新增 | 替代 s05 的 `load_messages()`，显式读取完整事实。 |
 | `SessionManager.build_context()` | 新增 | 提供唯一的活跃模型上下文构建入口。 |
 | `SessionManager.append_message()` | 修改 | 从写入 `SessionMessage` 改为写入 `MessageEntry`。 |
-| `append_compaction()`、`append_custom()` | 新增 | 预留 checkpoint 与扩展状态的写入边界；s06 主流程尚未调用。 |
+| `append_compaction()`、`append_custom()` | 新增 | 分别写入已有 checkpoint 与扩展状态。 |
 | `with_session_context()` | 新增 | 在不改动 s05 `agent_loop()` 的前提下，注入实时投影结果。 |
 | `main()` | 修改 | 将 `history` 改为 `active_context`，并使用 `with_session_context()`。 |
 | `session_path_from_cli()`、`agent_loop()`、`SYSTEM`、工具分发 | 来自 s05：保持 | 会话投影不改变启动策略、系统提示词或工具执行职责。 |
@@ -111,6 +111,6 @@ s06 可读取 s05 的旧扁平 `message` Record；但 s05 不认识 s06 的嵌�
 
 ## 参考与差异
 
-- Pi 把 Session 设计为多类型追加式 Entry，并通过 `buildSessionContext()` 从最近 compaction checkpoint 重建模型上下文，解决“完整审计记录”与“有限上下文窗口”不能共用一份列表的问题。s06 保留 Entry 与投影边界，但暂不实现 Pi 的 `id`、`parentId`、分支和事务；s07 将实际生成并写入 `CompactionEntry`，分支会话章节编号待定。
-- lcc 在 Context Compact 一章同时实现 token 估算、截断和摘要。本项目先拆出 Pi 风格投影层，因为摘要必须有可恢复的 checkpoint 载体；s08 将实现 token 估算和自动触发。
-- Pi 的 `custom` Entry 可由注入的 projector 决定是否进入模型上下文。s06 先默认忽略，避免扩展数据耦合到 `agent_loop()`；任务状态章节将通过 projector 落地，编号待定。
+- Pi 把 Session 设计为多类型追加式 Entry，并通过 `buildSessionContext()` 从最近 compaction checkpoint 重建模型上下文，解决“完整审计记录”与“有限上下文窗口”不能共用一份列表的问题。s06 保留 Entry 与投影边界，但不采用 Pi 的分支与事务模型；当前只处理线性 JSONL 日志。s07 将通过 `append_compaction()` 验证 checkpoint 写入。
+- lcc 在 Context Compact 一章同时实现 token 估算、截断和摘要。本项目将投影层单独实现，使完整日志和模型输入的关系保持清晰。
+- Pi 的 `custom` Entry 可由注入的 projector 决定是否进入模型上下文。s06 使用固定规则：`custom` 只持久化，不投影到 `agent_loop()`。
