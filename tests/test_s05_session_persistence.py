@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import s05_session.code as chapter
+import s05_session_persistence.code as chapter
 
 
 def test_default_session_root_is_scoped_to_s05() -> None:

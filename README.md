@@ -29,16 +29,16 @@ python -m s02_tool_use.code
 python -m s03_permission.code
 # 运行第四章：工具调用 Hooks
 python -m s04_hooks.code
-# 运行第五章：会话持久化
-python -m s05_session.code
+# 运行第五章：会话系统 · 持久化
+python -m s05_session_persistence.code
 # 加载已有的第五章会话
-python -m s05_session.code --session .sessions\s05\session-20260919-120000.jsonl
-# 运行第六章：会话上下文投影
+python -m s05_session_persistence.code --session .sessions\s05\session-20260919-120000.jsonl
+# 运行第六章：会话系统 · 记录与上下文投影
 python -m s06_session_context.code
 # 加载已有会话并按 s06 Entry 规则构建模型上下文
 python -m s06_session_context.code --session .sessions\s06\session-20260919-120000.jsonl
 # 运行测试
 python -m pytest
 # 检查代码规范
-ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session s06_session_context src tests
+ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session_persistence s06_session_context src tests
 ```

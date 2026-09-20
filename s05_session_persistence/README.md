@@ -1,4 +1,4 @@
-# s05：会话持久化
+# s05：会话系统 · 持久化
 
 本章在 s04 的 Agent loop 上增加线性 JSONL 会话：每次默认创建新对话；只有在启动时传入 `--session`，才加载指定历史记录。
 
@@ -37,10 +37,10 @@ Message → SessionMessage → JsonlSessionStore → SessionManager → agent_lo
 
 ```powershell
 # 创建新的独立会话；实际文件路径会在启动后打印
-python -m s05_session.code
+python -m s05_session_persistence.code
 
 # 加载一个已有的历史会话
-python -m s05_session.code --session .sessions\s05\session-20260919-120000.jsonl
+python -m s05_session_persistence.code --session .sessions\s05\session-20260919-120000.jsonl
 ```
 
 从项目根目录使用 `-m` 运行，以保证章节之间的兄弟模块可以正常导入。默认会话保存在 `.sessions/s05/`；`--session` 指向的文件必须已经存在。

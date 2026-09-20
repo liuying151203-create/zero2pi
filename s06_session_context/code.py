@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""s06：会话上下文投影。
+"""s06：会话系统 · 记录与上下文投影。
 
 本章将 s05 的“JSONL 文件等于模型 messages”改为 Pi 风格的两层结构：
 
@@ -23,7 +23,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 from s04_hooks import code as s04
-from s05_session import code as previous
+from s05_session_persistence import code as previous
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
@@ -294,7 +294,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     # 来自 s04：保持；会话投影不改变工具权限 Hook 的职责。
     hooks = Hooks(before_tool_call=[make_permission_hook()])
 
-    print("s06：会话上下文投影")
+    print("s06：会话系统 · 记录与上下文投影")
     print(f"会话文件：{session.path}")
     print(f"初始模型上下文：{len(initial_context)} 条消息。")
     print("输入任务，输入 q 退出。\n")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""s05：线性会话持久化。
+"""s05：会话系统 · 持久化。
 
 本章把 s04 的内存消息历史保存到 JSONL 文件：
 
@@ -396,7 +396,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     load_dotenv(override=True)
     model = os.getenv("MODEL_ID")
     if not model:
-        raise RuntimeError("Set MODEL_ID in .env before running s05_session.")
+        raise RuntimeError("Set MODEL_ID in .env before running s05_session_persistence.")
 
     timeout_seconds = float(os.getenv("MODEL_TIMEOUT_SECONDS", "60"))
     max_retries = int(os.getenv("MODEL_MAX_RETRIES", "0"))
@@ -427,7 +427,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     # 来自 s04：保持；s05 复用 s04 的权限 Hook，不在会话章节重复实现。
     hooks = Hooks(before_tool_call=[previous.make_permission_hook()])
 
-    print("s05：会话持久化")
+    print("s05：会话系统 · 持久化")
     print(f"会话文件：{session.path}")
     if history:
         print(f"已恢复 {len(history)} 条消息。")
