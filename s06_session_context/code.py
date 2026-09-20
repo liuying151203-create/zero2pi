@@ -282,7 +282,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     # 来自 s05：保持；继续使用启动参数决定新会话或指定历史会话。
     session = SessionManager.open(previous.session_path_from_cli(arguments))
     # s06 修改：模型不直接加载全部记录，而是从 Entry 日志投影活跃上下文。
-    active_context = session.build_context()
+    initial_context = session.build_context()
     # s06 新增：以函数注入方式在每次请求前重新构建上下文，贴近 Pi 的投影边界。
     request_with_context = with_session_context(create_message, session.build_context)
     # 来自 s04：保持；会话投影不改变工具权限 Hook 的职责。
@@ -290,7 +290,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
 
     print("s06：会话上下文投影")
     print(f"会话文件：{session.path}")
-    print(f"当前模型上下文：{len(active_context)} 条消息。")
+    print(f"初始模型上下文：{len(initial_context)} 条消息。")
     print("输入任务，输入 q 退出。\n")
 
     while True:
