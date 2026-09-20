@@ -31,7 +31,7 @@ from zero2pi.ui import (
     format_user_prompt,
 )
 
-# s06 修改：使用独立目录，避免 s06 的嵌套 Record 与 s05 的扁平 Record 混在同一位置。
+# s06 修改：使用独立目录，避免不同章节的会话记录混在同一位置。
 SESSION_ROOT = Path(".sessions/s06")
 
 # ===== 来自 s05：Agent 运行时依赖（保持） =====
@@ -94,7 +94,7 @@ class MessageEntry:
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> MessageEntry:
         """读取 s06 嵌套消息 Record。"""
-        # s06 修改：章节目录隔离后不再兼容 s05 的扁平 Record，只接受自身格式。
+        # s06 修改：s06 Record 必须包含嵌套 message 字段，保持日志结构单一。
         raw_message = record.get("message")
         return cls(
             message=_message_from_record(raw_message),

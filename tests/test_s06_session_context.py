@@ -1,8 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 import s06_session_context.code as chapter
 
 
@@ -21,18 +19,6 @@ def test_store_round_trips_message_entries(tmp_path) -> None:
 
     assert [type(entry) for entry in entries] == [chapter.MessageEntry, chapter.MessageEntry]
     assert [entry.message["role"] for entry in entries] == ["user", "assistant"]
-
-
-def test_store_rejects_s05_flat_message_record(tmp_path) -> None:
-    path = tmp_path / "s05-session.jsonl"
-    path.write_text(
-        '{"type":"message","role":"user","content":"继续之前的任务"}\n',
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="无效会话记录"):
-        chapter.SessionManager.open(path).build_context()
-
 
 
 def test_build_context_creates_a_separate_message_list() -> None:

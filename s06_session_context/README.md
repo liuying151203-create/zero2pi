@@ -84,7 +84,7 @@ python -m s06_session_context.code
 python -m s06_session_context.code --session .sessions\s06\session-20260919-120000.jsonl
 ```
 
-s06 只读取并写入自身的嵌套 `message` Record；默认会话目录为 `.sessions/s06/`，与 s05 的 `.sessions/s05/` 隔离。
+s06 只读取并写入自身的嵌套 `message` Record；默认会话目录为 `.sessions/s06/`。
 
 ## 参考与差异
 
