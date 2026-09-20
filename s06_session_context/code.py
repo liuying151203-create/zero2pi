@@ -3,10 +3,9 @@
 
 本章将 s05 的“JSONL 文件等于模型 messages”改为 Pi 风格的两层结构：
 
-    完整 SessionEntry 日志 -> build_session_context() -> 模型 messages
+    完整 MessageEntry 日志 -> build_session_context() -> 模型 messages
 
-日志会保留 message、compaction 和 custom 三种 Entry；当前章节只实现投影，
-不自动创建 compaction。
+当前章节只保存和投影消息记录。
 """
 
 from __future__ import annotations
@@ -43,8 +42,8 @@ dispatch_tool = previous.dispatch_tool
 make_permission_hook = s04.make_permission_hook
 
 # ===== s06 新增：术语约定 =====
-# Message：模型 API 使用的 role/content 字典；Entry：内存中带类型的会话日志对象；
-# Record：Entry 序列化为 JSONL 一行前后使用的原始 dict。Entry 负责持久化语义，
+# Message：模型 API 使用的 role/content 字典；MessageEntry：内存中的持久化消息对象；
+# Record：MessageEntry 序列化为 JSONL 一行前后使用的原始 dict。MessageEntry 负责日志，
 # Message 只表示模型可见上下文，二者不能再像 s05 一样视为同一列表。
 
 
@@ -107,205 +106,81 @@ class MessageEntry:
         }
 
 
-@dataclass(frozen=True)
-class CompactionEntry:
-    """记录一个替代旧历史的上下文 checkpoint。
-
-    作用：保存历史摘要和仍需原样发送给模型的最近消息；完整旧消息不会从 JSONL 删除。
-    输入：摘要文本、保留尾部消息和可选时间戳。
-    输出：投影时生成“摘要消息 + 保留尾部”的上下文起点。
-    边界：该对象只表示已经存在的 checkpoint；本章不负责生成摘要文本。
-    """
-
-    # s06 新增：摘要与保留尾部组成一个可恢复的 checkpoint 载体。
-    summary: str
-    retained_tail: list[Message]
-    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-
-    @classmethod
-    def from_record(cls, record: dict[str, Any]) -> CompactionEntry:
-        """从 JSONL 记录恢复 compaction checkpoint。"""
-        summary = record.get("summary")
-        tail = record.get("retained_tail", [])
-        if not isinstance(summary, str):
-            raise TypeError("压缩记录的 summary 必须是字符串")
-        if not isinstance(tail, list):
-            raise TypeError("压缩记录的 retained_tail 必须是列表")
-        return cls(
-            summary=summary,
-            retained_tail=[_message_from_record(message) for message in tail],
-            timestamp=str(record.get("timestamp", "")),
-        )
-
-    def to_record(self) -> dict[str, Any]:
-        """转换为包含摘要和保留尾部的 JSONL 记录。"""
-        return {
-            "type": "compaction",
-            "summary": self.summary,
-            "retained_tail": self.retained_tail,
-            "timestamp": self.timestamp,
-        }
-
-
-@dataclass(frozen=True)
-class CustomEntry:
-    """记录不直接属于模型对话的扩展状态。
-
-    作用：保存不直接属于模型对话的扩展状态。
-    输入：扩展类型、JSON 数据和可选时间戳。
-    输出：默认不投影到模型的 Session Entry。
-    """
-
-    # s06 新增：扩展状态与模型消息分离，避免非对话数据污染 Agent loop。
-    custom_type: str
-    data: Any = None
-    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
-
-    @classmethod
-    def from_record(cls, record: dict[str, Any]) -> CustomEntry:
-        """从 JSONL 记录恢复自定义 Entry。"""
-        custom_type = record.get("custom_type")
-        if not isinstance(custom_type, str) or not custom_type:
-            raise ValueError("自定义记录的 custom_type 必须是非空字符串")
-        return cls(
-            custom_type=custom_type,
-            data=record.get("data"),
-            timestamp=str(record.get("timestamp", "")),
-        )
-
-    def to_record(self) -> dict[str, Any]:
-        """转换为 JSONL 记录。"""
-        return {
-            "type": "custom",
-            "custom_type": self.custom_type,
-            "data": previous._to_jsonable(self.data),
-            "timestamp": self.timestamp,
-        }
-
-
-SessionEntry = MessageEntry | CompactionEntry | CustomEntry
-
-
-# s06 新增：在 JSONL 读取边界把无类型 Record 分派为受约束的 Entry 对象。
-def entry_from_record(record: object) -> SessionEntry:
-    """根据 type 分派 JSONL 记录并恢复为对应的 Session Entry。"""
+# s06 新增：在 JSONL 读取边界把无类型 Record 恢复为受约束的 MessageEntry 对象。
+def entry_from_record(record: object) -> MessageEntry:
+    """校验 message Record 并恢复为 MessageEntry。"""
     if not isinstance(record, dict):
         raise TypeError("会话记录必须是对象")
-    entry_type = record.get("type")
-    if entry_type == "message":
-        return MessageEntry.from_record(record)
-    if entry_type == "compaction":
-        return CompactionEntry.from_record(record)
-    if entry_type == "custom":
-        return CustomEntry.from_record(record)
-    raise ValueError(f"未知会话记录类型：{entry_type}")
+    if record.get("type") != "message":
+        raise ValueError("会话记录类型必须是 message")
+    return MessageEntry.from_record(record)
 
 
 # ===== 来自 s05：JSONL 存储层（修改） =====
-# s05 的 Store 只读写 SessionMessage；s06 保持追加式 I/O，但读写完整 SessionEntry 日志。
+# s05 的 Store 读写 SessionMessage；s06 保持追加式 I/O，但改为读写 MessageEntry 日志。
 
 class JsonlSessionStore:
-    """以追加式 JSONL 保存和读取完整 Session Entry 日志。
+    """以追加式 JSONL 保存和读取完整 MessageEntry 日志。
 
-    作用：只处理 Entry 的文件 I/O，不决定哪些记录需要发送给模型。
+    作用：只处理消息日志的文件 I/O，不决定模型请求如何构建上下文。
     输入：会话 JSONL 文件路径。
-    输出：按文件顺序读出的完整 `SessionEntry` 列表。
-    流程：每次追加一行 Entry；读取时逐行解析，并在错误中保留行号。
+    输出：按文件顺序读出的完整 `MessageEntry` 列表。
+    流程：每次追加一行消息记录；读取时逐行解析，并在错误中保留行号。
     """
 
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def append(self, entry: SessionEntry) -> None:
-        """将一个 Entry 追加为一行 JSON。"""
-        # s06 修改：参数由 SessionMessage 改为 SessionEntry，使同一日志可保存 checkpoint 和扩展状态。
+    def append(self, entry: MessageEntry) -> None:
+        """将一个 MessageEntry 追加为一行 JSON。"""
+        # s06 修改：参数由 SessionMessage 改为 MessageEntry，使日志对象与模型 Message 明确分层。
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(entry.to_record(), ensure_ascii=False)
         with self.path.open("a", encoding="utf-8", newline="\n") as file:
             file.write(line + "\n")
 
-    def read_all(self) -> list[SessionEntry]:
+    def read_all(self) -> list[MessageEntry]:
         """读取完整日志；损坏记录会以带行号的 ValueError 报告。"""
         if not self.path.exists():
             return []
 
-        entries: list[SessionEntry] = []
+        entries: list[MessageEntry] = []
         for line_number, line in enumerate(
             self.path.read_text(encoding="utf-8").splitlines(), start=1
         ):
             if not line.strip():
                 continue
             try:
-                # s06 修改：不再只接受 message Record，而是按 type 恢复为对应的 Entry。
+                # s06 修改：读取 Record 后恢复为 MessageEntry，而不是直接返回模型 Message。
                 entries.append(entry_from_record(json.loads(line)))
             except (json.JSONDecodeError, TypeError, ValueError) as error:
                 raise ValueError(f"无效会话记录，第 {line_number} 行：{error}") from error
         return entries
 
 
-# s06 新增：按最近 checkpoint 划分完整日志与活跃上下文，s05 没有此投影步骤。
-def build_context_entries(entries: Sequence[SessionEntry]) -> list[SessionEntry]:
-    """选择构成当前上下文的 Entry 路径。
-
-    作用：复用 Pi 的 checkpoint 语义；最近一次 compaction 已概括其之前历史，
-    因此模型只需看到该 checkpoint 及其后的 Entry。
-    输入：按写入顺序排列的完整 Session Entry 日志。
-    输出：不修改原日志的上下文 Entry 列表。
-    流程：从后向前寻找最近 compaction；找到则截取该 Entry 及其后缀，否则保留全部。
-    """
-    # 参考 Pi：最近 checkpoint 概括旧历史；本项目先在线性日志中实现该投影，不引入分支路径。
-    for index in range(len(entries) - 1, -1, -1):
-        if isinstance(entries[index], CompactionEntry):
-            # s06 新增：最近 checkpoint 是完整历史到活跃上下文的边界，旧日志仍保留在磁盘。
-            return list(entries[index:])
-    return list(entries)
-
-
-def _summary_message(entry: CompactionEntry) -> Message:
-    """把 checkpoint 摘要包装为后续模型可继续使用的用户消息。"""
-    return {
-        "role": "user",
-        "content": f"[历史会话摘要，供继续任务]\n\n{entry.summary}",
-    }
-
-
-# s06 新增：不同 Entry 可投影成不同数量的模型 Message，避免持久化类型泄漏给 Agent loop。
-def project_entry(entry: SessionEntry) -> list[Message]:
-    """将一个 Entry 投影为零条或多条模型消息。"""
-    if isinstance(entry, MessageEntry):
-        return [entry.message]
-    if isinstance(entry, CompactionEntry):
-        return [_summary_message(entry), *entry.retained_tail]
-    # 参考 Pi：custom 由 projector 决定是否投影；s06 先默认忽略，避免扩展数据耦合 Agent loop。
-    return []
-
-
-# s06 新增：组合 Entry 选择与逐条投影，作为唯一的模型上下文构建入口。
-def build_session_context(entries: Sequence[SessionEntry]) -> list[Message]:
+# s06 新增：将完整日志中的 MessageEntry 显式投影为模型 Message，作为唯一上下文入口。
+def build_session_context(entries: Sequence[MessageEntry]) -> list[Message]:
     """把完整会话日志投影成单次模型请求所需的消息列表。
 
     作用：隔离“保存所有事实”和“模型看见哪些上下文”两个职责。
-    输入：完整 Session Entry 日志，可含 message、compaction 和 custom 记录。
-    输出：按顺序排列、可直接传给模型的消息；custom 默认不会出现在结果中。
-    流程：选择最近 checkpoint 后的 Entry → 逐条投影 → 拼接模型消息。
+    输入：按写入顺序排列的完整 MessageEntry 日志。
+    输出：按顺序排列、可直接传给模型的 Message 列表。
+    流程：依次取出每个 Entry 内部的 Message，生成独立的模型上下文列表。
     """
-    messages: list[Message] = []
-    for entry in build_context_entries(entries):
-        messages.extend(project_entry(entry))
-    return messages
+    return [entry.message for entry in entries]
 
 
 # ===== 来自 s05：SessionManager（修改） =====
-# s05 的 Manager 返回完整 Message 历史；s06 将“读取完整日志”与“构建模型上下文”拆成两套接口。
+# s05 的 Manager 直接返回完整 Message 历史；s06 先读取 MessageEntry 日志，再显式构建上下文。
 
 class SessionManager:
-    """协调 Entry 日志、上下文投影和 Agent 的消息保存。
+    """协调 MessageEntry 日志、上下文投影和 Agent 的消息保存。
 
     作用：向运行时提供“追加完整事实”和“构建模型上下文”两套明确接口，
     防止 Agent loop 直接依赖 JSONL 文件格式。
     输入：绑定会话文件的 `JsonlSessionStore`。
-    输出：完整日志、投影后的模型消息，或新追加的 Entry。
-    流程：读取完整 Entry → 调用投影函数构建上下文；运行中把新消息追加为 MessageEntry。
+    输出：完整日志、投影后的模型消息，或新追加的 MessageEntry。
+    流程：读取完整 MessageEntry → 调用投影函数构建上下文；运行中把新消息追加为 MessageEntry。
     """
 
     def __init__(self, store: JsonlSessionStore) -> None:
@@ -323,7 +198,7 @@ class SessionManager:
         # 来自 s05：保持；路径访问语义不随上下文投影改变。
         return self.store.path
 
-    def load_entries(self) -> list[SessionEntry]:
+    def load_entries(self) -> list[MessageEntry]:
         """读取未投影的完整会话日志。"""
         # s06 新增：替代 s05 的 load_messages()，让调用方可区分完整事实与模型上下文。
         return self.store.read_all()
@@ -337,21 +212,6 @@ class SessionManager:
         """把 Agent 运行时消息作为完整事实追加到会话日志。"""
         # s06 修改：s05 直接追加 SessionMessage；现在包装成 MessageEntry 后再追加到统一日志。
         self.store.append(MessageEntry.from_message(message))
-
-    def append_compaction(self, summary: str, retained_tail: Sequence[Message]) -> None:
-        """将已准备好的摘要和保留尾部追加为 checkpoint。"""
-        # s06 新增：checkpoint 作为完整日志的一条事实记录，与原始消息并存。
-        self.store.append(
-            CompactionEntry(
-                summary=summary,
-                retained_tail=[_normalize_message(message) for message in retained_tail],
-            )
-        )
-
-    def append_custom(self, custom_type: str, data: Any = None) -> None:
-        """追加默认不参与模型上下文的扩展记录。"""
-        # s06 新增：扩展数据会被持久化，但当前投影规则默认忽略它。
-        self.store.append(CustomEntry(custom_type=custom_type, data=data))
 
 
 # ===== s06 新增：在模型请求边界注入上下文 =====
