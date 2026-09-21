@@ -350,9 +350,82 @@ def split_context_for_compaction(
             start -= 1
         else:
             start += 1
-    summary_source = list(messages[:start])
+    messages_to_summarize = list(messages[:start])
     retained_tail = list(messages[start:])
-    return summary_source, retained_tail
+    return messages_to_summarize, retained_tail
+
+
+# s07 修改：显式保存准备阶段结果，让执行压缩的方法只读取计划而不再推导消息边界。
+@dataclass(frozen=True)
+class CompactionPlan:
+    """描述一次压缩已经准备好的输入。
+
+    作用：明确区分旧摘要、本次待总结消息和继续原样保留的最近消息。
+    输入：旧摘要、尚未摘要消息的分割结果，以及压缩前上下文字符数。
+    输出：供 `ContextCompactor` 直接执行的不可变计划。
+    流程：由 `prepare_compaction()` 创建，再交给摘要、大小校验和持久化步骤使用。
+    """
+
+    previous_summary: str | None
+    messages_to_summarize: tuple[Message, ...]
+    retained_tail: tuple[Message, ...]
+    before_chars: int
+
+
+# 参考 Pi：准备阶段只计算压缩边界，模型调用和落盘由后续执行阶段负责。
+def prepare_compaction(
+    entries: Sequence[SessionEntry],
+    policy: CompactionPolicy,
+) -> CompactionPlan | None:
+    """根据完整会话日志准备一次压缩计划。
+
+    作用：找出旧摘要尚未覆盖的消息，并按字符预算划分待总结部分和保留尾部。
+    输入：按时间排列的完整 SessionEntry，以及当前压缩策略。
+    输出：上下文未超限时返回 None；需要压缩时返回 `CompactionPlan`。
+    流程：投影当前上下文并检查大小 → 找到最新压缩点 → 合并上次保留尾部与
+    压缩点后的新消息 → 按预算分割为待总结消息和保留尾部。
+    """
+    active_context = build_session_context(entries)
+    before_chars = estimate_context_chars(active_context)
+    if before_chars <= policy.max_context_chars:
+        return None
+
+    last_compaction_index = None
+    for index in range(len(entries) - 1, -1, -1):
+        if isinstance(entries[index], CompactionEntry):
+            last_compaction_index = index
+            break
+
+    previous_summary = None
+    unsummarized_messages: list[Message] = []
+    if last_compaction_index is not None:
+        previous_compaction = entries[last_compaction_index]
+        assert isinstance(previous_compaction, CompactionEntry)
+        previous_summary = previous_compaction.summary
+        # s07 修改：上次保留尾部尚未进入旧摘要，本次必须继续参与分割。
+        unsummarized_messages.extend(previous_compaction.retained_tail)
+        later_entries = entries[last_compaction_index + 1 :]
+    else:
+        later_entries = entries
+
+    # s07 修改：压缩点后的原始消息与上次保留尾部共同组成“尚未摘要消息”。
+    unsummarized_messages.extend(
+        entry.message for entry in later_entries if isinstance(entry, MessageEntry)
+    )
+    messages_to_summarize, retained_tail = split_context_for_compaction(
+        unsummarized_messages,
+        policy.keep_recent_chars,
+    )
+    if not messages_to_summarize:
+        # s07 修改：旧摘要本身超限时，把尚未摘要消息全部合并进去，为新摘要留出空间。
+        messages_to_summarize, retained_tail = retained_tail, []
+
+    return CompactionPlan(
+        previous_summary=previous_summary,
+        messages_to_summarize=tuple(messages_to_summarize),
+        retained_tail=tuple(retained_tail),
+        before_chars=before_chars,
+    )
 
 
 def _text_value(value: object) -> str:
@@ -422,7 +495,7 @@ class CompactionOutcome:
 # s07 修改：回退摘要保留已有摘要和用户原文，不再只留下会话文件指针。
 def _fallback_summary(
     session_path: Path,
-    messages: Sequence[Message],
+    messages_to_summarize: Sequence[Message],
     previous_summary: str | None,
 ) -> str:
     """从确定信息构造回退摘要，避免摘要模型失败时丢失任务目标。"""
@@ -431,7 +504,7 @@ def _fallback_summary(
         sections.append(f"已有摘要：\n{previous_summary}")
 
     user_texts: list[str] = []
-    for message in messages:
+    for message in messages_to_summarize:
         if message.get("role") != "user" or not isinstance(message.get("content"), str):
             continue
         user_texts.append(_truncate_for_summary(str(message["content"]), 1000, "用户消息"))
@@ -475,14 +548,14 @@ def _fit_summary_to_budget(
     return fitted
 
 
-# s07 新增：压缩器只负责阈值判断、分割和持久化，摘要生成由注入函数负责。
+# s07 修改：压缩器消费准备好的计划，按顺序完成摘要、校验和持久化。
 class ContextCompactor:
     """在请求边界按策略压缩活跃会话上下文。
 
-    作用：上下文超出阈值时，摘要较早消息并将摘要与保留尾部写回会话日志。
+    作用：会话需要压缩时，根据准备计划生成摘要并把结果写回会话日志。
     输入：SessionManager、CompactionPolicy 和可注入的摘要函数。
     输出：发生压缩时返回包含压缩来源和前后大小的结果；未超过阈值时返回 None。
-    流程：检查大小 → 分离旧摘要与新增消息 → 按字符预算分割 → 更新摘要 → 复核大小并落盘。
+    流程：准备压缩计划 → 更新摘要或生成回退文本 → 复核大小 → 保存压缩记录。
     """
 
     def __init__(
@@ -500,72 +573,46 @@ class ContextCompactor:
 
         输入：实例持有的会话、阈值策略和摘要函数。
         输出：未压缩返回 None；压缩后返回 `CompactionOutcome` 供请求层展示统计信息。
-        流程：检查当前投影 → 找到旧压缩点 → 只总结旧尾部和新增消息 → 限制最终大小并落盘。
+        流程：准备计划 → 总结计划中的消息 → 必要时回退 → 限制最终大小并落盘。
         """
-        # s07 新增：只估算当前活跃上下文；已被旧压缩点替代的历史无需再次发送给模型。
-        context = self.session.build_context()
-        context_chars = estimate_context_chars(context)
-        if context_chars <= self.policy.max_context_chars:
+        # s07 修改：准备阶段集中解释消息边界，上层方法只展示压缩执行顺序。
+        plan = prepare_compaction(self.session.load_entries(), self.policy)
+        if plan is None:
             return None
 
-        # 参考 Pi：旧摘要独立传给摘要器，只把旧尾部和压缩点后的新消息作为新增记录。
-        entries = self.session.load_entries()
-        last_compaction_index = None
-        for index in range(len(entries) - 1, -1, -1):
-            if isinstance(entries[index], CompactionEntry):
-                last_compaction_index = index
-                break
-
-        previous_summary = None
-        compactable_messages: list[Message] = []
-        if last_compaction_index is not None:
-            previous_compaction = entries[last_compaction_index]
-            assert isinstance(previous_compaction, CompactionEntry)
-            previous_summary = previous_compaction.summary
-            compactable_messages.extend(previous_compaction.retained_tail)
-            later_entries = entries[last_compaction_index + 1 :]
-        else:
-            later_entries = entries
-        compactable_messages.extend(
-            entry.message for entry in later_entries if isinstance(entry, MessageEntry)
-        )
-
-        summary_source, retained_tail = split_context_for_compaction(
-            compactable_messages,
-            self.policy.keep_recent_chars,
-        )
-        if not summary_source:
-            summary_source, retained_tail = retained_tail, []
-
-        # s07 修改：摘要器显式接收旧摘要，避免把“摘要消息”当普通消息反复摘要。
-        summary = self.summarize(summary_source, previous_summary)
+        # 参考 Pi：旧摘要和待总结消息分开传入，执行的是增量更新而非摘要套摘要。
+        summary = self.summarize(plan.messages_to_summarize, plan.previous_summary)
         if summary is None:
-            summary = _fallback_summary(self.session.path, summary_source, previous_summary)
+            summary = _fallback_summary(
+                self.session.path,
+                plan.messages_to_summarize,
+                plan.previous_summary,
+            )
             summary_kind: Literal["model", "fallback"] = "fallback"
         else:
             summary_kind = "model"
         summary = _fit_summary_to_budget(
             summary,
-            retained_tail,
+            plan.retained_tail,
             self.policy.max_context_chars,
             self.session.path,
         )
-        after_chars = estimate_context_chars(_summary_context(summary, retained_tail))
+        after_chars = estimate_context_chars(_summary_context(summary, plan.retained_tail))
         if after_chars > self.policy.max_context_chars:
             raise RuntimeError("压缩后上下文仍超过字符阈值")
-        self.session.append_compaction(summary, retained_tail)
+        self.session.append_compaction(summary, plan.retained_tail)
         return CompactionOutcome(
             summary_kind=summary_kind,
-            before_chars=context_chars,
+            before_chars=plan.before_chars,
             after_chars=after_chars,
-            summarized_messages=len(summary_source),
-            retained_messages=len(retained_tail),
+            summarized_messages=len(plan.messages_to_summarize),
+            retained_messages=len(plan.retained_tail),
         )
 
 
 # s07 新增：摘要调用使用原始模型请求函数，避免被会话上下文包装器递归覆盖输入。
 def summarize_context(
-    messages: Sequence[Message],
+    messages_to_summarize: Sequence[Message],
     create_message: Callable[..., Any],
     *,
     previous_summary: str | None = None,
@@ -574,20 +621,21 @@ def summarize_context(
     """把消息序列交给模型并返回摘要文本。
 
     作用：把待压缩消息序列化为普通用户文本，避免在摘要请求中重放工具调用协议。
-    输入：待压缩的新消息、底层模型请求函数、可选旧摘要和摘要输出 token 上限。
+    输入：尚未进入旧摘要的待总结消息、底层模型请求函数、可选旧摘要和输出 token 上限。
     输出：摘要文本；两次请求都没有最终文本时返回 None。
     流程：裁剪工具结果并序列化 → 携带旧摘要请求更新 → 必要时扩大输出额度重试一次。
     """
 
     # 参考 Pi：旧摘要和新增记录使用独立区块，工具结果在摘要请求边界截断。
-    transcript = serialize_context_for_summary(messages)
+    transcript = serialize_context_for_summary(messages_to_summarize)
     previous_section = (
         f"<previous-summary>\n{previous_summary}\n</previous-summary>\n\n"
         if previous_summary
         else ""
     )
     prompt = (
-        f"{previous_section}<new-messages>\n{transcript}\n</new-messages>\n\n"
+        f"{previous_section}<unsummarized-messages>\n{transcript}\n"
+        "</unsummarized-messages>\n\n"
         "请生成更新后的完整摘要。"
     )
     token_limits = [max_tokens]
@@ -617,12 +665,12 @@ class ContextSummarizer:
 
     def __call__(
         self,
-        messages: Sequence[Message],
+        messages_to_summarize: Sequence[Message],
         previous_summary: str | None,
     ) -> str | None:
-        """使用旧摘要和新增消息生成完整的新摘要。"""
+        """使用旧摘要和尚未摘要的消息生成完整的新摘要。"""
         return summarize_context(
-            messages,
+            messages_to_summarize,
             self.create_message,
             previous_summary=previous_summary,
             max_tokens=self.max_tokens,

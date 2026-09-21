@@ -77,10 +77,33 @@ def test_compactor_keeps_tool_use_and_result_together() -> None:
     ]
 
     tail_budget = chapter.estimate_context_chars(messages[1:])
-    summary_source, retained_tail = chapter.split_context_for_compaction(messages, tail_budget)
+    messages_to_summarize, retained_tail = chapter.split_context_for_compaction(
+        messages,
+        tail_budget,
+    )
 
-    assert summary_source == [messages[0]]
+    assert messages_to_summarize == [messages[0]]
     assert retained_tail == messages[1:]
+
+
+def test_prepare_compaction_combines_previous_tail_and_later_messages() -> None:
+    previous_tail = _message("assistant", "上次压缩时保留的回答" * 20)
+    later_message = _message("user", "上次压缩后新增的任务" * 20)
+    entries: list[chapter.SessionEntry] = [
+        chapter.MessageEntry.from_message(_message("user", "已进入旧摘要的消息")),
+        chapter.CompactionEntry.create("旧摘要", [previous_tail]),
+        chapter.MessageEntry.from_message(later_message),
+    ]
+
+    plan = chapter.prepare_compaction(
+        entries,
+        chapter.CompactionPolicy(max_context_chars=300, keep_recent_chars=100),
+    )
+
+    assert plan is not None
+    assert plan.previous_summary == "旧摘要"
+    assert list(plan.messages_to_summarize) == [previous_tail, later_message]
+    assert list(plan.retained_tail) == []
 
 
 def test_request_wrapper_compacts_then_uses_latest_context(tmp_path) -> None:

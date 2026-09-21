@@ -8,16 +8,17 @@ s06 将完整日志投影为模型上下文；s07 在每次模型请求前检查
 flowchart LR
     A[当前模型上下文] --> B{超过字符阈值?}
     B -- 否 --> C[请求模型]
-    B -- 是 --> D[分离旧摘要与新增消息]
-    D --> E[按字符预算划分摘要区和保留尾部]
-    E --> F[截断摘要输入中的巨型工具结果]
-    F --> G{模型返回摘要文本?}
-    G -- 是 --> H[更新旧摘要]
-    G -- 否 --> I[提取已有摘要和用户原文作为 fallback]
-    H --> J[复核并限制压缩后大小]
-    I --> J
-    J --> K[追加 CompactionEntry]
-    K --> C
+    B -- 是 --> D[准备 CompactionPlan]
+    D --> E[分离旧摘要与尚未摘要消息]
+    E --> F[按字符预算划分待总结消息和保留尾部]
+    F --> G[截断摘要输入中的巨型工具结果]
+    G --> H{模型返回摘要文本?}
+    H -- 是 --> I[更新旧摘要]
+    H -- 否 --> J[提取已有摘要和用户原文作为 fallback]
+    I --> K[复核并限制压缩后大小]
+    J --> K
+    K --> L[追加 CompactionEntry]
+    L --> C
 ```
 
 ```text
@@ -31,8 +32,9 @@ MessageEntry ... → CompactionEntry(summary + retained_tail) → active_context
 ```mermaid
 flowchart TB
     A[ModelRequester] -->|create_message| D[ContextSummarizer]
-    B[SessionManager] -->|session| E[ContextCompactor]
-    C[CompactionPolicy] -->|policy| E
+    B[SessionManager] -->|entries| P["prepare_compaction()"]
+    C[CompactionPolicy] -->|policy| P
+    P -->|CompactionPlan| E[ContextCompactor]
     D -->|summarize| E
     A -->|create_message| F[CompactedContextRequester]
     B -->|session| F
@@ -47,8 +49,10 @@ flowchart TB
 
 | 组件 | 作用 | 调用关系 |
 | --- | --- | --- |
-| `CompactionPolicy` | 定义总字符阈值和最近上下文字符预算 | 供 `ContextCompactor` 判断和分割 |
-| `ContextCompactor` | 分割上下文、调用摘要函数、写入压缩记录 | 请求前由 `CompactedContextRequester` 调用 |
+| `CompactionPolicy` | 定义总字符阈值和最近上下文字符预算 | 供 `prepare_compaction()` 判断和分割 |
+| `CompactionPlan` | 明确保存旧摘要、待总结消息和保留尾部 | 由准备阶段创建，交给 `ContextCompactor` 执行 |
+| `prepare_compaction()` | 投影上下文并计算本次压缩边界 | 将完整日志和策略转换为 `CompactionPlan` |
+| `ContextCompactor` | 按计划生成摘要、复核大小并写入记录 | 请求前由 `CompactedContextRequester` 调用 |
 | `CompactionOutcome` | 保存压缩来源及压缩前后字符数 | 供请求层直接打印压缩结果 |
 | `CompactionEntry` | 保存摘要与最近消息 | 被 `SessionManager` 追加到 JSONL |
 | `build_session_context()` | 只投影最新压缩点及其后的消息 | 每次请求前重新运行 |
@@ -59,11 +63,11 @@ flowchart TB
 
 保留尾部使用字符预算，而不是固定消息条数。若单条工具结果超过预算，它会进入摘要区；摘要请求最多保留该工具结果的前 2000 字符。完整内容仍留在 JSONL。若边界落在 `assistant(tool_use)` 与 `user(tool_result)` 之间，二者会一起保留或一起进入摘要区。
 
-再次压缩时，最新 `CompactionEntry.summary` 会作为 `previous_summary` 单独传入摘要器；摘要区只包含旧压缩点的保留尾部和之后新增的 `MessageEntry`。这样模型执行的是“更新已有摘要”，不会把 `[会话摘要]` 当作普通对话反复总结。
+再次压缩时，最新 `CompactionEntry.summary` 会作为 `previous_summary` 单独传入摘要器；上次的 `retained_tail` 加上压缩点之后新增的 `MessageEntry`，共同组成“尚未被旧摘要覆盖的消息”。`prepare_compaction()` 再把它们划分为 `messages_to_summarize` 和新的 `retained_tail`。这样模型执行的是“更新已有摘要”，不会把 `[会话摘要]` 当作普通对话反复总结。
 
 `main()` 先选择会话路径、打开会话，再以具名参数组装组件：`ContextSummarizer` 保存摘要请求所需的模型请求器与额度，`ContextCompactor` 负责压缩决策和落盘。入口将 `CompactedContextRequester` 传给本章展开的 `agent_loop()`，由循环在需要模型响应时调用它。
 
-正常请求顺序为：`compact_if_needed()` 检查并按需保存压缩结果 → `session.build_context()` 重建上下文 → 替换本次请求的 `messages` → 请求模型。摘要生成直接调用底层请求器，避免再次触发压缩。投影函数从日志末尾向前寻找最新压缩点，再依次追加摘要、保留尾部和新消息。
+正常请求顺序为：`prepare_compaction()` 生成压缩计划 → `compact_if_needed()` 按计划生成并保存摘要 → `session.build_context()` 重建上下文 → 替换本次请求的 `messages` → 请求模型。摘要生成直接调用底层请求器，避免再次触发压缩。投影函数从日志末尾向前寻找最新压缩点，再依次追加摘要、保留尾部和新消息。
 
 ## 运行
 
@@ -106,5 +110,5 @@ SESSION_COMPACTION_KEEP_RECENT_CHARS=400
 
 ## 参考与差异
 
-- Pi 将压缩结果作为会话 Entry 保存，按 token 预算选择保留尾部，并把旧摘要与新增消息分开更新；摘要序列化时还会截断巨型工具结果。s07 保留这些关键边界，但使用更容易观察的字符预算。
+- Pi 先用 `prepareCompaction` 明确旧摘要、待总结消息和保留尾部，再执行模型摘要。s07 保留这个两阶段设计，并把结果保存为会话 Entry；预算使用更容易观察的字符数，摘要输入仍会截断巨型工具结果。
 - lcc 使用工具输出持久化、裁剪、微压缩和手动压缩等多层管线。本章只实现会话摘要这一条自动路径，避免在同一章节混入多种压缩策略。
