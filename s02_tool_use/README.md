@@ -8,6 +8,20 @@
 tool_name + arguments → TOOL_HANDLERS → handler(**arguments) → tool_result
 ```
 
+## 组装结构
+
+箭头表示左侧向右侧提供工具定义、注册项或函数参数；运行调用顺序见下方调用链。
+
+```mermaid
+flowchart TB
+    A[TOOLS] -->|tools| B["agent_loop()"]
+    C[run_* 处理函数] -->|注册项| D[TOOL_HANDLERS]
+    D -->|名称到处理函数的映射| E[dispatch_tool]
+    E -->|dispatch| B
+```
+
+本章只关注多工具结构：工具定义和统一分发入口传给循环，具体处理函数注册到 `TOOL_HANDLERS`，再由 `dispatch_tool()` 使用。
+
 ## 组件关系与调用链
 
 本章没有新增类，核心职责由三个数据/函数层次组成：

@@ -21,6 +21,20 @@ flowchart TD
 tool_call → before_tool_call → dispatch → after_tool_call → tool_result
 ```
 
+## 组装结构
+
+箭头表示左侧组件被注册或作为依赖提供给右侧组件；运行先后见上方流程图。
+
+```mermaid
+flowchart TB
+    A[make_permission_hook 返回值] -->|before_tool_call 注册项| B[Hooks]
+    B -->|hooks| C["execute_tool()"]
+    D[dispatch_tool] -->|dispatch| C
+    C -->|统一工具执行入口| E["agent_loop()"]
+```
+
+本章只画 Hook 生命周期的组装：权限 Hook 注册进 `Hooks`，再与分发器一起交给 `execute_tool()`；循环通过这个统一入口执行工具。
+
 ## 组件关系与调用链
 
 本章新增的核心组件如下：

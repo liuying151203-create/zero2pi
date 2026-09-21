@@ -22,6 +22,19 @@ flowchart TD
 Message → SessionMessage → JsonlSessionStore → SessionManager → agent_loop
 ```
 
+## 组装结构
+
+箭头表示左侧向右侧提供构造参数、初始数据或保存函数；运行中的写入顺序见架构流程。
+
+```mermaid
+flowchart TB
+    A[JsonlSessionStore] -->|store| B[SessionManager]
+    B -->|load_messages 返回的 history| C["agent_loop()"]
+    B -->|append_message 作为 save_message| C
+```
+
+本章只关注持久化接入：存储对象传给 `SessionManager`，管理器再向循环提供初始历史和消息保存函数。
+
 ## 组件关系与调用链
 
 | 层次 | 组件 | 作用 |

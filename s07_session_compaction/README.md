@@ -22,6 +22,25 @@ flowchart LR
 MessageEntry ... → CompactionEntry(summary + retained_tail) → active_context → 模型请求
 ```
 
+## 组装结构
+
+箭头统一表示左侧组件作为标注参数传给右侧组件；调用先后见上方架构流程。
+
+```mermaid
+flowchart TB
+    A[ModelRequester] -->|create_message| D[ContextSummarizer]
+    B[SessionManager] -->|session| E[ContextCompactor]
+    C[CompactionPolicy] -->|policy| E
+    D -->|summarize| E
+    A -->|create_message| F[CompactedContextRequester]
+    B -->|session| F
+    E -->|compactor| F
+    F -->|create_message| G["agent_loop()"]
+    B -->|append_message 作为 save_message| G
+```
+
+装配顺序与代码一致：`policy`、`session`、`summarizer` 传给 `ContextCompactor`；`compactor`、`session`、底层 `requester` 再传给 `CompactedContextRequester`；最后把 `request_with_context` 作为 `create_message` 传给 `agent_loop()`。因此循环调用它时，会依次触发压缩判断、最新上下文投影和模型请求。
+
 ## 组件关系
 
 | 组件 | 作用 | 调用关系 |

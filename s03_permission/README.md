@@ -25,6 +25,20 @@ flowchart TD
 tool_call → check_permission → confirm（必要时） → dispatch → tool_result
 ```
 
+## 组装结构
+
+箭头表示左侧组件向右侧提供对应能力；它描述权限入口的组成，不表示执行顺序。
+
+```mermaid
+flowchart TB
+    A[check_permission] -->|permission| D["execute_tool()"]
+    B[confirm_permission] -->|confirm| D
+    C[dispatch_tool] -->|dispatch| D
+    D -->|统一工具执行入口| E["agent_loop()"]
+```
+
+`execute_tool()` 组合本章新增的权限判断、用户确认和既有分发器，并作为 `agent_loop()` 使用的统一工具执行入口。
+
 ## 组件关系与调用链
 
 本章新增的核心组件如下：

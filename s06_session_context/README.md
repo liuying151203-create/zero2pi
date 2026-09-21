@@ -61,6 +61,20 @@ flowchart TD
 
 请求方法显式执行三步：`active_context = self.build_context()` 构建上下文，`kwargs["messages"] = active_context` 替换本次请求参数，再调用 `self.create_message(**kwargs)`。这里不会修改循环持有的内存列表；`kwargs` 是本次调用收集到的关键字参数字典。
 
+## 组装结构
+
+箭头表示左侧组件作为构造参数、绑定方法或保存函数提供给右侧组件；它不表示请求顺序。
+
+```mermaid
+flowchart TB
+    A[ModelRequester] -->|create_message| C[SessionContextRequester]
+    B[SessionManager.build_context] -->|build_context| C
+    C -->|create_message| D["agent_loop()"]
+    E[SessionManager.append_message] -->|save_message| D
+```
+
+本章新增的 `SessionContextRequester` 接收底层模型请求器和 Session 的上下文构建方法，再作为循环的 `create_message`；Session 的追加方法仍作为 `save_message`。
+
 ## 方法变化
 
 | s06 代码 | 相对 s05 | 作用 |

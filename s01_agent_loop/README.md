@@ -7,6 +7,18 @@
                          ↑__________________________|
 ```
 
+## 组装结构
+
+箭头表示左侧组件作为标注参数传给右侧组件；运行先后见开头的核心循环。
+
+```mermaid
+flowchart TB
+    A[ModelRequester] -->|create_message| C["agent_loop()"]
+    B[execute_bash] -->|execute_tool| C
+```
+
+本章只画两个可替换依赖：`main()` 创建模型请求器，并把它和工具执行函数传给 `agent_loop()`；循环只负责编排。
+
 ## 运行
 
 在项目根目录执行：
