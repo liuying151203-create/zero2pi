@@ -20,10 +20,10 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 from s03_permission import code as previous
+from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
-    format_model_request,
     format_tool_call,
     format_tool_result,
     format_user_prompt,
@@ -293,13 +293,8 @@ def main() -> None:
         client_options["base_url"] = base_url
 
     client = Anthropic(**client_options)
-
-    def create_message(**kwargs: Any) -> Any:
-        print(format_model_request(timeout_seconds), flush=True)
-        try:
-            return client.messages.create(model=model, **kwargs)
-        except Exception as error:
-            raise RuntimeError(f"模型请求失败：{error}") from error
+    # s04 修改：复用公共模型请求组件，main() 只展示 Hooks 的依赖组装。
+    requester = ModelRequester(client, model, timeout_seconds)
 
     # s04 新增：把 s03 的权限策略注册为 before hook。
     hooks = Hooks(before_tool_call=[make_permission_hook()])
@@ -321,7 +316,7 @@ def main() -> None:
         try:
             agent_loop(
                 history,
-                create_message=create_message,
+                create_message=requester,
                 dispatch=dispatch_tool,
                 system=SYSTEM,
                 hooks=hooks,
