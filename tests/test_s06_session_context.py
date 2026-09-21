@@ -60,7 +60,7 @@ def test_context_wrapper_rebuilds_messages_before_each_model_request(tmp_path) -
 
     result = chapter.agent_loop(
         session.build_context(),
-        create_message=chapter.with_session_context(create_message, session.build_context),
+        create_message=chapter.SessionContextRequester(create_message, session.build_context),
         dispatch=lambda name, arguments: "文件内容",
         system="test system",
         hooks=chapter.Hooks(),

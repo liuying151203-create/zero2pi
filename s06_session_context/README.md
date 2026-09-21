@@ -27,7 +27,7 @@ JSONL Record → MessageEntry → active_context → 模型请求
 | --- | --- |
 | `load_messages()` 直接得到模型 Message 列表 | `load_entries()` 先得到完整 `MessageEntry` 日志 |
 | 完整历史就是模型上下文 | `build_context()` 显式创建独立的 `active_context` |
-| 模型请求直接使用 `history` | `with_session_context()` 在请求边界重新构建上下文 |
+| 模型请求直接使用 `history` | `SessionContextRequester` 在请求边界重新构建上下文 |
 
 当前没有筛选或压缩规则，因此 s06 的 `active_context` 内容与完整消息日志一致；变化在于两个概念已经有了独立边界。
 
@@ -39,9 +39,9 @@ flowchart TD
     B --> C[SessionManager.load_entries]
     C --> D[SessionManager.build_context]
     D --> E[active_context: Message 列表]
-    E --> F[with_session_context]
-    F --> G[s05 agent_loop 请求模型]
-    G --> H[新 MessageEntry 追加到日志]
+    E --> F[s05 agent_loop]
+    F --> G[SessionContextRequester 重建上下文并请求模型]
+    G --> H[循环将新 MessageEntry 追加到日志]
     H --> C
 ```
 
@@ -52,12 +52,14 @@ flowchart TD
   → SessionManager.append_message()
   → SessionManager.build_context()
   → agent_loop(active_context)
-  → with_session_context() 重新 build_context()
+  → SessionContextRequester 重新 build_context()
   → 模型请求
   → assistant / tool_result 追加为 MessageEntry
 ```
 
-`active_context` 只是当前模型输入；完整日志通过 `SessionManager.load_entries()` 获取。包装函数会在每次模型请求前重新调用 `build_context()`，因此工具结果落盘后，下一次模型请求能够读取最新上下文。
+`active_context` 只是当前模型输入；完整日志通过 `SessionManager.load_entries()` 获取。`SessionContextRequester` 会在每次模型请求前重新调用 `build_context()`，因此工具结果落盘后，下一次模型请求能够读取最新上下文。
+
+请求方法显式执行三步：`active_context = self.build_context()` 构建上下文，`kwargs["messages"] = active_context` 替换本次请求参数，再调用 `self.create_message(**kwargs)`。这里不会修改循环持有的内存列表；`kwargs` 是本次调用收集到的关键字参数字典。
 
 ## 方法变化
 
@@ -70,8 +72,8 @@ flowchart TD
 | `SessionManager.load_entries()` | 新增 | 返回完整 MessageEntry 日志。 |
 | `SessionManager.build_context()` | 新增 | 作为构建活跃模型上下文的唯一入口。 |
 | `SessionManager.append_message()` | 修改 | 将 Message 包装为 `MessageEntry` 后写入日志。 |
-| `with_session_context()` | 新增 | 在不修改 s05 `agent_loop()` 的前提下，注入最新上下文。 |
-| `main()` | 修改 | 使用 `active_context` 与请求包装函数。 |
+| `SessionContextRequester` | 新增 | 在不修改 s05 `agent_loop()` 的前提下，注入最新上下文。 |
+| `main()` | 修改 | 使用 `active_context` 与 `SessionContextRequester`。 |
 | `session_path_from_cli()`、`agent_loop()`、`SYSTEM`、工具分发 | 来自 s05：保持 | 会话投影不改变启动、提示词或工具职责。 |
 
 ## 运行

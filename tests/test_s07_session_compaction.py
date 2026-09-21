@@ -100,10 +100,11 @@ def test_request_wrapper_compacts_then_uses_latest_context(tmp_path) -> None:
         chapter.CompactionPolicy(max_context_chars=20, keep_recent_messages=1),
         lambda messages: "第一条摘要",
     )
-    chapter.request_with_compacted_context(
+    chapter.CompactedContextRequester(
         create_message,
         session,
         compactor,
+    )(
         messages=[_message("user", "不应使用这条内存消息")],
     )
 

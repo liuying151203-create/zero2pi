@@ -24,10 +24,10 @@ from dotenv import load_dotenv
 
 from s04_hooks import code as s04
 from s05_session_persistence import code as previous
+from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
-    format_model_request,
     format_user_prompt,
 )
 
@@ -209,8 +209,9 @@ class SessionManager:
 
     def build_context(self) -> list[Message]:
         """读取完整日志并构造当前模型上下文。"""
-    # s06 新增：统一由投影规则产生模型输入，使 Session 与 Agent loop 保持隔离。
-        return build_session_context(self.load_entries())
+        # s06 新增：先读取完整日志，再投影模型上下文，明确两者的边界。
+        entries = self.load_entries()
+        return build_session_context(entries)
 
     def append_message(self, message: Message) -> None:
         """把 Agent 运行时消息作为完整事实追加到会话日志。"""
@@ -220,26 +221,32 @@ class SessionManager:
 
 # ===== s06 新增：在模型请求边界注入上下文 =====
 
-ContextBuilder = Callable[[], list[Message]]
+type ContextBuilder = Callable[[], list[Message]]
 
 
-def with_session_context(
-    create_message: Callable[..., Any],
-    build_context: ContextBuilder,
-) -> Callable[..., Any]:
-    """为既有模型请求函数注入最新的 Session 上下文。
+# s06 修改：用可调用组件替代“函数返回函数”，让会话上下文依赖在入口处显式可见。
+@dataclass(frozen=True)
+class SessionContextRequester:
+    """在模型请求边界注入最新的 Session 上下文。
 
     作用：保持 s05 `agent_loop()` 的工具循环不变，并在真正请求模型前统一投影会话。
-    输入：底层模型请求函数，以及无参的上下文构建函数。
-    输出：签名兼容 `create_message` 的包装函数。
-    流程：接收 loop 参数 → 用最新 `build_context()` 覆盖 messages → 调用底层请求函数。
+    输入：底层模型请求函数、无参上下文构建函数和本次模型请求参数。
+    输出：底层模型客户端的响应对象。
+    流程：构建最新上下文 → 覆盖 messages → 调用底层请求函数。
     """
 
-    def request_with_context(**kwargs: Any) -> Any:
-        # 参考 Pi：消息在请求边界实时投影，保存日志不再等同于模型输入。
-        return create_message(**{**kwargs, "messages": build_context()})
+    create_message: Callable[..., Any]
+    build_context: ContextBuilder
 
-    return request_with_context
+    def __call__(self, **kwargs: Any) -> Any:
+        """接收模型请求参数，重新构建上下文后请求模型并返回响应。
+
+        只替换本次请求的 messages；核心循环持有的内存列表不在这里修改。
+        """
+        # 参考 Pi：消息在请求边界实时投影，保存日志不再等同于模型输入。
+        active_context = self.build_context()
+        kwargs["messages"] = active_context
+        return self.create_message(**kwargs)
 
 
 # ===== 来自 s05：终端入口（修改） =====
@@ -255,7 +262,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     作用：选择会话文件，追加完整 Entry 日志，并在每次模型请求前构建活跃上下文。
     输入：s05 保持的 `--session <路径>` 启动参数，以及终端中的自然语言任务。
     输出：会话文件提示、工具调用、工具结果和模型回答；空行、`q` 或 `exit` 退出。
-    流程：打开会话 → 创建底层模型请求函数 → 注入 Session Context → 运行 s05 agent loop。
+    流程：打开会话 → 创建 ModelRequester → 组装 SessionContextRequester → 运行 s05 agent loop。
     """
     load_dotenv(override=True)
     model = os.getenv("MODEL_ID")
@@ -273,24 +280,19 @@ def main(arguments: Sequence[str] | None = None) -> None:
     if base_url := os.getenv("ANTHROPIC_BASE_URL"):
         client_options["base_url"] = base_url
     client = Anthropic(**client_options)
-
-    def create_message(**kwargs: Any) -> Any:
-        """调用配置好的模型客户端并展示请求状态。"""
-        # 来自 s05：保持；底层 API 请求逻辑不关心消息来自完整历史还是投影结果。
-        print(format_model_request(timeout_seconds), flush=True)
-        try:
-            return client.messages.create(model=model, **kwargs)
-        except Exception as error:
-            raise RuntimeError(f"模型请求失败：{error}") from error
+    # s06 修改：复用公共模型请求组件，main() 只组装会话上下文依赖。
+    requester = ModelRequester(client, model, timeout_seconds)
 
     # s06 修改：复用 s05 的启动参数解析，但指定 s06 专属默认目录以隔离存储格式。
-    session = SessionManager.open(
-        previous.session_path_from_cli(arguments, session_root=SESSION_ROOT)
-    )
+    session_path = previous.session_path_from_cli(arguments, session_root=SESSION_ROOT)
+    session = SessionManager.open(session_path)
     # s06 修改：模型不直接加载全部记录，而是从 Entry 日志投影活跃上下文。
     initial_context = session.build_context()
     # s06 新增：以函数注入方式在每次请求前重新构建上下文，贴近 Pi 的投影边界。
-    request_with_context = with_session_context(create_message, session.build_context)
+    request_with_context = SessionContextRequester(
+        create_message=requester,
+        build_context=session.build_context,
+    )
     # 来自 s04：保持；会话投影不改变工具权限 Hook 的职责。
     hooks = Hooks(before_tool_call=[make_permission_hook()])
 

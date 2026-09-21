@@ -16,7 +16,6 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,10 +24,10 @@ from dotenv import load_dotenv
 
 from s05_session_persistence import code as s05
 from s06_session_context import code as previous
+from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
-    format_model_request,
     format_user_prompt,
 )
 
@@ -137,14 +136,12 @@ def build_session_context(entries: Sequence[SessionEntry]) -> list[Message]:
     输出：按协议顺序排列、可直接传给模型的独立 Message 列表。
     流程：定位最后一个压缩点 → 写入摘要和保留尾部 → 追加压缩点之后的新消息。
     """
-    last_compaction_index = next(
-        (
-            index
-            for index in range(len(entries) - 1, -1, -1)
-            if isinstance(entries[index], CompactionEntry)
-        ),
-        None,
-    )
+    # s07 修改：相对 s06 的完整投影，从后向前找到最新压缩点作为起点。
+    last_compaction_index = None
+    for index in range(len(entries) - 1, -1, -1):
+        if isinstance(entries[index], CompactionEntry):
+            last_compaction_index = index
+            break
     if last_compaction_index is None:
         return [entry.message for entry in entries if isinstance(entry, MessageEntry)]
 
@@ -155,7 +152,11 @@ def build_session_context(entries: Sequence[SessionEntry]) -> list[Message]:
         for entry in entries[last_compaction_index + 1 :]
         if isinstance(entry, MessageEntry)
     ]
-    return [_summary_message(compaction), *compaction.retained_tail, *later_messages]
+    # s07 新增：按摘要、保留尾部、新消息的顺序组装模型输入。
+    active_context = [_summary_message(compaction)]
+    active_context.extend(compaction.retained_tail)
+    active_context.extend(later_messages)
+    return active_context
 
 
 # ===== 来自 s06：JSONL 存储层（修改） =====
@@ -237,7 +238,8 @@ class SessionManager:
     def build_context(self) -> list[Message]:
         """读取完整日志并构造当前模型上下文。"""
         # s07 修改：上下文投影会识别最新压缩点，避免把全部历史重新发送给模型。
-        return build_session_context(self.load_entries())
+        entries = self.load_entries()
+        return build_session_context(entries)
 
     def append_message(self, message: Message) -> None:
         """把 Agent 运行时消息作为完整事实追加到会话日志。"""
@@ -307,11 +309,18 @@ def split_context_for_compaction(
     messages: Sequence[Message],
     keep_recent_messages: int,
 ) -> tuple[list[Message], list[Message]]:
-    """把活跃上下文划分为待总结部分和协议完整的保留尾部。"""
+    """把活跃上下文划分为待总结部分和协议完整的保留尾部。
+
+    输入：按时间排列的消息和最近消息保留数量。
+    输出：较早消息列表、最近消息列表；不会修改输入。
+    流程：计算分割位置 → 必要时回退以保留工具调用配对 → 返回两部分。
+    """
     start = max(0, len(messages) - keep_recent_messages)
     if start > 0 and _is_tool_result(messages[start]) and _has_tool_use(messages[start - 1]):
         start -= 1
-    return list(messages[:start]), list(messages[start:])
+    summary_source = list(messages[:start])
+    retained_tail = list(messages[start:])
+    return summary_source, retained_tail
 
 
 type SummarizeContext = Callable[[Sequence[Message]], str | None]
@@ -349,10 +358,16 @@ class ContextCompactor:
         self.summarize = summarize
 
     def compact_if_needed(self) -> CompactionOutcome | None:
-        """仅在存在可总结历史且上下文超过阈值时追加压缩记录。"""
+        """根据当前会话与策略决定是否压缩，并保存结果。
+
+        输入：实例持有的会话、阈值策略和摘要函数。
+        输出：未压缩返回 None；保存模型摘要返回 model，保存回退摘要返回 fallback。
+        流程：构建上下文 → 检查大小 → 分割消息 → 生成摘要或回退文本 → 追加压缩记录。
+        """
         # s07 新增：只估算当前活跃上下文；已被旧压缩点替代的历史无需再次发送给模型。
         context = self.session.build_context()
-        if estimate_context_chars(context) <= self.policy.max_context_chars:
+        context_chars = estimate_context_chars(context)
+        if context_chars <= self.policy.max_context_chars:
             return None
 
         summary_source, retained_tail = split_context_for_compaction(
@@ -408,47 +423,52 @@ def summarize_context(
     return None
 
 
+# s07 新增：把摘要函数和它需要的模型请求器组成一个可读的依赖组件。
+@dataclass(frozen=True)
+class ContextSummarizer:
+    """保存摘要模型调用依赖，并把它暴露为可调用对象。"""
+
+    create_message: Callable[..., Any]
+    max_tokens: int
+
+    def __call__(self, messages: Sequence[Message]) -> str | None:
+        """为指定消息生成摘要，失败时交给压缩器生成安全回退摘要。"""
+        return summarize_context(messages, self.create_message, max_tokens=self.max_tokens)
+
+
 # s07 修改：每次请求前先尝试压缩，再用最新投影覆盖 Agent loop 的内存 messages。
-def request_with_compacted_context(
-    create_message: Callable[..., Any],
-    session: SessionManager,
-    compactor: ContextCompactor,
-    **kwargs: Any,
-) -> Any:
-    """执行一次带自动压缩和最新会话上下文的模型请求。
+@dataclass(frozen=True)
+class CompactedContextRequester:
+    """在模型请求前执行压缩并注入最新会话上下文。
 
     作用：保持 s05 的 Agent loop 不变，把压缩决策固定在真正请求模型之前。
     输入：底层模型请求函数、当前会话、上下文压缩器和本次模型请求参数。
     输出：底层模型客户端的响应对象。
     流程：尝试压缩 → 从完整日志重新投影上下文 → 覆盖 messages → 调用底层请求函数。
     """
-    outcome = compactor.compact_if_needed()
-    if outcome == "model":
-        print("会话  已压缩较早上下文。", flush=True)
-    elif outcome == "fallback":
-        print("会话  摘要模型未返回文本，已使用安全回退摘要。", flush=True)
-    return create_message(**{**kwargs, "messages": session.build_context()})
+
+    create_message: Callable[..., Any]
+    session: SessionManager
+    compactor: ContextCompactor
+
+    def __call__(self, **kwargs: Any) -> Any:
+        """接收模型请求参数，压缩会话后使用最新上下文请求模型。
+
+        输出：底层模型响应。先完成压缩与落盘，再重建上下文、替换 messages；
+        核心循环的内存列表保持原样，替换仅作用于本次请求参数。
+        """
+        outcome = self.compactor.compact_if_needed()
+        if outcome == "model":
+            print("会话  已压缩较早上下文。", flush=True)
+        elif outcome == "fallback":
+            print("会话  摘要模型未返回文本，已使用安全回退摘要。", flush=True)
+        # s07 修改：压缩记录落盘后重新投影，使本次请求使用摘要和保留消息。
+        active_context = self.session.build_context()
+        kwargs["messages"] = active_context
+        return self.create_message(**kwargs)
 
 
 # ===== 来自 s06：终端入口（修改） =====
-
-
-# s07 新增：把模型客户端调用从 main() 中提取出来，摘要请求和正常请求共享同一组件。
-@dataclass(frozen=True)
-class ModelRequester:
-    """封装模型客户端、模型名称和统一请求状态输出。"""
-
-    client: Any
-    model: str
-    timeout_seconds: float
-
-    def __call__(self, **kwargs: Any) -> Any:
-        """发送一次模型请求，并将客户端异常转换为运行时错误。"""
-        print(format_model_request(self.timeout_seconds), flush=True)
-        try:
-            return self.client.messages.create(model=self.model, **kwargs)
-        except Exception as error:
-            raise RuntimeError(f"模型请求失败：{error}") from error
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -468,7 +488,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     作用：选择 s07 会话、创建摘要模型调用，并在每次正常模型请求前自动压缩过长上下文。
     输入：s05 保持的 --session 参数，以及终端中的自然语言任务。
     输出：会话文件提示、压缩提示、工具调用、工具结果和模型回答；空行、q 或 exit 退出。
-    流程：加载配置 → 打开会话 → 组装压缩器和请求包装器 → 运行既有 Agent loop。
+    流程：加载配置 → 打开会话 → 组装 ModelRequester、ContextCompactor 和请求组件 → 运行既有 Agent loop。
     """
     load_dotenv(override=True)
     model = os.getenv("MODEL_ID")
@@ -487,27 +507,29 @@ def main(arguments: Sequence[str] | None = None) -> None:
         client_options["base_url"] = base_url
     client = Anthropic(**client_options)
 
-    # s07 修改：正常请求与摘要请求都通过同一个顶层模型组件，避免 main() 嵌套请求函数。
+    # s07 修改：正常请求与摘要请求都通过公共模型组件，避免 main() 嵌套请求函数。
     requester = ModelRequester(client, model, timeout_seconds)
 
     # s07 修改：复用 s05 的启动参数解析，但使用 s07 专属默认目录。
-    session = SessionManager.open(
-        s05.session_path_from_cli(arguments, session_root=SESSION_ROOT)
-    )
+    session_path = s05.session_path_from_cli(arguments, session_root=SESSION_ROOT)
+    session = SessionManager.open(session_path)
     # s07 新增：环境变量直接映射到唯一的自动压缩策略，便于观察阈值效果。
     policy = CompactionPolicy(
         max_context_chars=_positive_int_env("SESSION_COMPACTION_MAX_CHARS", 24000),
         keep_recent_messages=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_MESSAGES", 6),
     )
     summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
-    summarizer = partial(
-        summarize_context,
+    summarizer = ContextSummarizer(
         create_message=requester,
         max_tokens=summary_max_tokens,
     )
     # s07 新增：摘要调用使用原始客户端；正常调用才经过压缩后的会话上下文包装。
-    compactor = ContextCompactor(session, policy, summarizer)
-    request_with_context = partial(request_with_compacted_context, requester, session, compactor)
+    compactor = ContextCompactor(session=session, policy=policy, summarize=summarizer)
+    request_with_context = CompactedContextRequester(
+        create_message=requester,
+        session=session,
+        compactor=compactor,
+    )
     # 来自 s06：保持；压缩不改变工具权限 Hook 的职责。
     hooks = Hooks(before_tool_call=[make_permission_hook()])
 
