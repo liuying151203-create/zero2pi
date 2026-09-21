@@ -19,7 +19,7 @@ JSONL Record → MessageEntry → active_context → 模型请求
 
 ## s05 与 s06 的关系
 
-共同点：两章都使用线性、追加式 JSONL；都通过 `--session <路径>` 加载历史；都在用户、助手和工具结果消息产生时保存；工具、权限 Hook 和 `agent_loop()` 都保持不变。
+共同点：两章都使用线性、追加式 JSONL；都通过 `--session <路径>` 加载历史；都在用户、助手和工具结果消息产生时保存；工具、权限 Hook 和 `agent_loop()` 的行为保持不变。为便于顺着单个章节阅读，s06 在当前文件中完整展开 `agent_loop()`，没有直接引用 s05 的函数。
 
 区别是消息的职责：
 
@@ -39,7 +39,7 @@ flowchart TD
     B --> C[SessionManager.load_entries]
     C --> D[SessionManager.build_context]
     D --> E[active_context: Message 列表]
-    E --> F[s05 agent_loop]
+    E --> F[s06 agent_loop]
     F --> G[SessionContextRequester 重建上下文并请求模型]
     G --> H[循环将新 MessageEntry 追加到日志]
     H --> C
@@ -72,9 +72,10 @@ flowchart TD
 | `SessionManager.load_entries()` | 新增 | 返回完整 MessageEntry 日志。 |
 | `SessionManager.build_context()` | 新增 | 作为构建活跃模型上下文的唯一入口。 |
 | `SessionManager.append_message()` | 修改 | 将 Message 包装为 `MessageEntry` 后写入日志。 |
-| `SessionContextRequester` | 新增 | 在不修改 s05 `agent_loop()` 的前提下，注入最新上下文。 |
+| `SessionContextRequester` | 新增 | 在模型请求边界注入最新上下文。 |
 | `main()` | 修改 | 使用 `active_context` 与 `SessionContextRequester`。 |
-| `session_path_from_cli()`、`agent_loop()`、`SYSTEM`、工具分发 | 来自 s05：保持 | 会话投影不改变启动、提示词或工具职责。 |
+| `agent_loop()` | 来自 s05：展开保持 | 行为不变，但在 s06 文件中完整展示请求、工具调用和消息保存流程。 |
+| `session_path_from_cli()`、`SYSTEM`、工具分发 | 来自 s05：保持 | 会话投影不改变启动、提示词或工具职责。 |
 
 ## 运行
 

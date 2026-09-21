@@ -28,6 +28,8 @@ from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
+    format_tool_call,
+    format_tool_result,
     format_user_prompt,
 )
 
@@ -35,13 +37,15 @@ from zero2pi.ui import (
 SESSION_ROOT = Path(".sessions/s06")
 
 # ===== 来自 s05：Agent 运行时依赖（保持） =====
-# s06 只改变会话日志到模型上下文的转换边界，工具、Hooks 和核心循环继续复用 s05。
+# s06 只改变会话日志到模型上下文的转换边界，工具和 Hooks 继续复用 s05。
 Message = previous.Message
 DispatchTool = previous.DispatchTool
 Hooks = previous.Hooks
 SYSTEM = previous.SYSTEM
-agent_loop = previous.agent_loop
+TOOLS = previous.TOOLS
+SessionSaver = previous.SessionSaver
 dispatch_tool = previous.dispatch_tool
+execute_tool = previous.execute_tool
 make_permission_hook = s04.make_permission_hook
 
 # ===== s06 新增：术语约定 =====
@@ -249,6 +253,81 @@ class SessionContextRequester:
         return self.create_message(**kwargs)
 
 
+# ===== 来自 s05：核心循环（展开保持） =====
+# s06 保留 s05 的消息与工具循环，并在当前文件完整展示；模型请求由上方组件重新投影上下文。
+
+def _get(block: Any, name: str) -> Any:
+    """兼容读取 SDK 对象和测试替身中的字段。"""
+    if isinstance(block, dict):
+        return block.get(name)
+    return getattr(block, name, None)
+
+
+def agent_loop(
+    messages: list[Message],
+    *,
+    create_message: Callable[..., Any],
+    dispatch: DispatchTool,
+    system: str,
+    hooks: Hooks,
+    save_message: SessionSaver | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    max_tokens: int = 8000,
+) -> list[Message]:
+    """运行 s06 的多工具 Agent 循环，并保存完整消息日志。
+
+    作用：完整展示一次“请求模型、执行工具、保存结果、继续请求”的循环；真正请求模型时，
+    `SessionContextRequester` 会从 MessageEntry 日志重新构建上下文。
+    输入：当前消息、模型请求组件、工具分发函数、系统提示词、Hooks 和可选保存函数。
+    输出：包含本次执行过程的消息列表；模型不再调用工具时返回。
+    流程：投影上下文并请求模型 → 追加并保存 assistant → 执行工具 → 追加并保存 tool_result
+    → 使用最新日志再次请求模型。
+    """
+    while True:
+        # s06 修改：调用请求组件时，会在模型请求边界从完整日志重新投影上下文。
+        response = create_message(
+            system=system,
+            messages=messages,
+            tools=tools or TOOLS,
+            max_tokens=max_tokens,
+        )
+        assistant_message = {
+            "role": "assistant",
+            "content": previous._to_jsonable(response.content),
+        }
+        messages.append(assistant_message)
+        if save_message is not None:
+            save_message(assistant_message)
+
+        tool_calls = [
+            block
+            for block in assistant_message["content"]
+            if _get(block, "type") == "tool_use"
+        ]
+        if not tool_calls:
+            return messages
+
+        results: list[dict[str, Any]] = []
+        for block in tool_calls:
+            name = _get(block, "name")
+            arguments = _get(block, "input") or {}
+            print(format_tool_call(name, arguments), flush=True)
+            output = execute_tool(name, arguments, dispatch=dispatch, hooks=hooks)
+            print(format_tool_result(output), flush=True)
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": _get(block, "id"),
+                    "content": output,
+                }
+            )
+
+        tool_message = {"role": "user", "content": results}
+        messages.append(tool_message)
+        if save_message is not None:
+            save_message(tool_message)
+
+
 # ===== 来自 s05：终端入口（修改） =====
 
 def _text_from_content(content: Any) -> str:
@@ -262,7 +341,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     作用：选择会话文件，追加完整 Entry 日志，并在每次模型请求前构建活跃上下文。
     输入：s05 保持的 `--session <路径>` 启动参数，以及终端中的自然语言任务。
     输出：会话文件提示、工具调用、工具结果和模型回答；空行、`q` 或 `exit` 退出。
-    流程：打开会话 → 创建 ModelRequester → 组装 SessionContextRequester → 运行 s05 agent loop。
+    流程：打开会话 → 创建 ModelRequester → 组装 SessionContextRequester → 运行本章 agent_loop。
     """
     load_dotenv(override=True)
     model = os.getenv("MODEL_ID")

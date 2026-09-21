@@ -31,12 +31,13 @@ MessageEntry ... → CompactionEntry(summary + retained_tail) → active_context
 | `CompactionEntry` | 保存摘要与最近消息 | 被 `SessionManager` 追加到 JSONL |
 | `build_session_context()` | 只投影最新压缩点及其后的消息 | 每次请求前重新运行 |
 | `CompactedContextRequester` | 在一次模型请求前执行压缩并注入最新上下文 | 由入口显式组装会话依赖 |
+| `agent_loop()` | 展示完整的模型与工具循环 | 行为继承 s06，在 s07 文件中展开并调用压缩请求组件 |
 
 压缩不会删除旧的 `MessageEntry`。读取时只从最后一个 `CompactionEntry` 开始：先放入摘要和它的 `retained_tail`，再追加该压缩点之后的新消息。因此 JSONL 保留完整事实，模型上下文保持较小。
 
 保留尾部时，若边界正好落在 `assistant(tool_use)` 与 `user(tool_result)` 之间，s07 会把这对消息一起保留，避免破坏模型工具调用协议。
 
-`main()` 先选择会话路径、打开会话，再以具名参数组装组件：`ContextSummarizer` 保存摘要请求所需的模型请求器与额度，`ContextCompactor` 负责压缩决策和落盘。入口将 `CompactedContextRequester` 传给复用的 `agent_loop()`，由循环在需要模型响应时调用它。
+`main()` 先选择会话路径、打开会话，再以具名参数组装组件：`ContextSummarizer` 保存摘要请求所需的模型请求器与额度，`ContextCompactor` 负责压缩决策和落盘。入口将 `CompactedContextRequester` 传给本章展开的 `agent_loop()`，由循环在需要模型响应时调用它。
 
 正常请求顺序为：`compact_if_needed()` 检查并按需保存压缩结果 → `session.build_context()` 重建上下文 → 替换本次请求的 `messages` → 请求模型。摘要生成直接调用底层请求器，避免再次触发压缩。投影函数从日志末尾向前寻找最新压缩点，再依次追加摘要、保留尾部和新消息。
 

@@ -28,6 +28,8 @@ from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
+    format_tool_call,
+    format_tool_result,
     format_user_prompt,
 )
 
@@ -41,12 +43,15 @@ COMPACTION_SYSTEM = """你负责压缩 Agent 会话记录。
 只输出最终摘要文本，不要只输出思考过程。"""
 
 # ===== 来自 s06：Agent 运行时依赖（保持） =====
-# s07 只替换会话 Entry 和上下文投影，工具、Hooks 与核心循环继续复用 s06。
+# s07 只替换会话 Entry 和上下文投影，工具与 Hooks 继续复用 s06。
 Message = previous.Message
+DispatchTool = previous.DispatchTool
 Hooks = previous.Hooks
 SYSTEM = previous.SYSTEM
-agent_loop = previous.agent_loop
+TOOLS = previous.TOOLS
+SessionSaver = previous.SessionSaver
 dispatch_tool = previous.dispatch_tool
+execute_tool = previous.execute_tool
 make_permission_hook = previous.make_permission_hook
 MessageEntry = previous.MessageEntry
 
@@ -466,6 +471,81 @@ class CompactedContextRequester:
         active_context = self.session.build_context()
         kwargs["messages"] = active_context
         return self.create_message(**kwargs)
+
+
+# ===== 来自 s06：核心循环（展开保持） =====
+# s07 在当前文件完整保留循环；相对 s06，模型请求组件会先压缩再投影最新上下文。
+
+def _get(block: Any, name: str) -> Any:
+    """兼容读取 SDK 对象和测试替身中的字段。"""
+    if isinstance(block, dict):
+        return block.get(name)
+    return getattr(block, name, None)
+
+
+def agent_loop(
+    messages: list[Message],
+    *,
+    create_message: Callable[..., Any],
+    dispatch: DispatchTool,
+    system: str,
+    hooks: Hooks,
+    save_message: SessionSaver | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    max_tokens: int = 8000,
+) -> list[Message]:
+    """运行 s07 的多工具 Agent 循环，并在请求前接入上下文压缩。
+
+    作用：完整展示消息循环；每次真正请求模型前，`CompactedContextRequester` 会检查阈值、
+    按需保存压缩记录，并从最新会话日志重新构建上下文。
+    输入：当前消息、带压缩能力的模型请求组件、工具分发函数、系统提示词、Hooks 和保存函数。
+    输出：包含本次执行过程的消息列表；模型不再调用工具时返回。
+    流程：按需压缩并请求模型 → 追加并保存 assistant → 执行工具 → 追加并保存 tool_result
+    → 使用最新压缩边界再次请求模型。
+    """
+    while True:
+        # s07 修改：请求组件先检查压缩，再把最新投影作为本次模型上下文。
+        response = create_message(
+            system=system,
+            messages=messages,
+            tools=tools or TOOLS,
+            max_tokens=max_tokens,
+        )
+        assistant_message = {
+            "role": "assistant",
+            "content": s05._to_jsonable(response.content),
+        }
+        messages.append(assistant_message)
+        if save_message is not None:
+            save_message(assistant_message)
+
+        tool_calls = [
+            block
+            for block in assistant_message["content"]
+            if _get(block, "type") == "tool_use"
+        ]
+        if not tool_calls:
+            return messages
+
+        results: list[dict[str, Any]] = []
+        for block in tool_calls:
+            name = _get(block, "name")
+            arguments = _get(block, "input") or {}
+            print(format_tool_call(name, arguments), flush=True)
+            output = execute_tool(name, arguments, dispatch=dispatch, hooks=hooks)
+            print(format_tool_result(output), flush=True)
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": _get(block, "id"),
+                    "content": output,
+                }
+            )
+
+        tool_message = {"role": "user", "content": results}
+        messages.append(tool_message)
+        if save_message is not None:
+            save_message(tool_message)
 
 
 # ===== 来自 s06：终端入口（修改） =====
