@@ -17,10 +17,10 @@ from typing import Any
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
-    format_model_request,
     format_tool_call,
     format_tool_result,
     format_user_prompt,
@@ -77,6 +77,15 @@ def run_bash(command: str, *, cwd: str | None = None) -> str:
 
     output = (result.stdout + result.stderr).strip()
     return output or "(no output)"
+
+
+# s01 新增：终端 bash 工具提到顶层，避免 main() 同时承载工具实现。
+def execute_bash(command: str) -> str:
+    """显示并执行一条 bash 工具调用。"""
+    print(format_tool_call("bash", {"command": command}), flush=True)
+    output = run_bash(command)
+    print(format_tool_result(output), flush=True)
+    return output
 
 
 # ===== s01 基础：响应读取辅助 =====
@@ -200,18 +209,8 @@ def main() -> None:
     if base_url := os.getenv("ANTHROPIC_BASE_URL"):
         client_options["base_url"] = base_url
     client = Anthropic(**client_options)
-    def create_message(**kwargs: Any) -> Any:
-        print(format_model_request(timeout_seconds), flush=True)
-        try:
-            return client.messages.create(model=model, **kwargs)
-        except Exception as error:
-            raise RuntimeError(f"模型请求失败：{error}") from error
-
-    def execute_bash(command: str) -> str:
-        print(format_tool_call("bash", {"command": command}), flush=True)
-        output = run_bash(command)
-        print(format_tool_result(output), flush=True)
-        return output
+    # s01 修改：使用顶层 ModelRequester，入口中的模型调用关系更直接。
+    requester = ModelRequester(client, model, timeout_seconds)
 
     print("s01：核心循环")
     print("输入任务，输入 q 退出。\n")
@@ -231,7 +230,7 @@ def main() -> None:
         try:
             agent_loop(
                 history,
-                create_message=create_message,
+                create_message=requester,
                 execute_tool=execute_bash,
                 system=SYSTEM,
             )

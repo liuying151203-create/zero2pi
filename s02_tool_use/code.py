@@ -21,10 +21,10 @@ from typing import Any
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
-    format_model_request,
     format_tool_call,
     format_tool_result,
     format_user_prompt,
@@ -360,12 +360,8 @@ def main() -> None:
         client_options["base_url"] = base_url
 
     client = Anthropic(**client_options)
-    def create_message(**kwargs: Any) -> Any:
-        print(format_model_request(timeout_seconds), flush=True)
-        try:
-            return client.messages.create(model=model, **kwargs)
-        except Exception as error:
-            raise RuntimeError(f"模型请求失败：{error}") from error
+    # s02 修改：复用 s01 的顶层模型请求组件，入口逻辑只保留工具分发组装。
+    requester = ModelRequester(client, model, timeout_seconds)
 
     print("s02：工具调用")
     print("输入任务，输入 q 退出。\n")
@@ -386,7 +382,7 @@ def main() -> None:
             # s02 修改：相对 s01，交互入口把多工具分发器注入核心循环。
             agent_loop(
                 history,
-                create_message=create_message,
+                create_message=requester,
                 dispatch=dispatch_tool,
                 system=SYSTEM,
             )
