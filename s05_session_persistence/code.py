@@ -24,10 +24,10 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 from s04_hooks import code as previous
+from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
     format_error,
-    format_model_request,
     format_tool_call,
     format_tool_result,
     format_user_prompt,
@@ -279,17 +279,6 @@ def session_path_from_cli(
 SessionSaver = Callable[[Message], None]
 
 
-def _append_message(
-    messages: list[Message],
-    message: Message,
-    save_message: SessionSaver | None,
-) -> None:
-    """同时更新内存历史和可选的持久化存储。"""
-    messages.append(message)
-    if save_message is not None:
-        save_message(message)
-
-
 # ===== s05 修改：核心循环接入会话保存 =====
 # s04 通过 Hooks 扩展工具生命周期；s05 只在消息产生时追加持久化回调。
 
@@ -329,12 +318,15 @@ def agent_loop(
             tools=tools or TOOLS,
             max_tokens=max_tokens,
         )
+        # s05 修改：相对 s04，先将 SDK 响应转为普通消息，便于写入 JSONL。
         assistant_message = {
             "role": "assistant",
             "content": _to_jsonable(response.content),
         }
-        # s05 修改：相对 s04，assistant 响应先标准化，再同时写入历史和会话文件。
-        _append_message(messages, assistant_message, save_message)
+        messages.append(assistant_message)
+        # s05 新增：内存追加后单独调用保存函数，明确会话落盘的时机。
+        if save_message is not None:
+            save_message(assistant_message)
 
         tool_calls = [
             block
@@ -365,8 +357,10 @@ def agent_loop(
             )
 
         tool_message = {"role": "user", "content": results}
+        messages.append(tool_message)
         # s05 新增：工具结果也必须持久化，否则恢复后消息协议会不完整。
-        _append_message(messages, tool_message, save_message)
+        if save_message is not None:
+            save_message(tool_message)
 
 
 # ===== 来自 s04：终端输出辅助（保持） =====
@@ -410,13 +404,8 @@ def main(arguments: Sequence[str] | None = None) -> None:
         client_options["base_url"] = base_url
 
     client = Anthropic(**client_options)
-
-    def create_message(**kwargs: Any) -> Any:
-        print(format_model_request(timeout_seconds), flush=True)
-        try:
-            return client.messages.create(model=model, **kwargs)
-        except Exception as error:
-            raise RuntimeError(f"模型请求失败：{error}") from error
+    # s05 修改：复用公共模型请求组件，main() 只负责会话和 Agent 依赖组装。
+    requester = ModelRequester(client, model, timeout_seconds)
 
     # s05 修改：会话只在启动阶段由 --session 选择；未指定时创建新的独立记录。
     session_path = session_path_from_cli(arguments)
@@ -444,12 +433,13 @@ def main(arguments: Sequence[str] | None = None) -> None:
             return
 
         user_message = {"role": "user", "content": query}
+        history.append(user_message)
         # s05 新增：用户消息在请求模型前落盘，保证中断后也能恢复输入。
-        _append_message(history, user_message, session.append_message)
+        session.append_message(user_message)
         try:
             agent_loop(
                 history,
-                create_message=create_message,
+                create_message=requester,
                 dispatch=dispatch_tool,
                 system=SYSTEM,
                 hooks=hooks,

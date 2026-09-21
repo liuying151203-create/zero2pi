@@ -31,7 +31,9 @@ Message → SessionMessage → JsonlSessionStore → SessionManager → agent_lo
 | 管理层 | `SessionManager` | 对外提供打开、加载和追加消息的接口 |
 | 启动选择 | `session_path_from_cli()` | 默认创建新文件；只在 `--session` 存在时选择历史文件 |
 
-`main()` 先调用 `session_path_from_cli()`，再用 `SessionManager.open()` 加载历史，并将 `session.append_message` 注入 `agent_loop()`。`_append_message()` 同时更新内存 `messages` 与 JSONL，确保恢复后仍包含工具调用及其结果。
+`main()` 先通过 `session_path_from_cli()` 选择文件，再用 `SessionManager.open()` 创建管理器、`load_messages()` 加载历史，并将 `session.append_message` 作为 `save_message` 传入 `agent_loop()`。
+
+每条新消息的处理直接写在产生消息的位置：先用 `messages.append(message)` 更新模型使用的内存历史，再用 `save_message(message)` 写入 JSONL。`save_message` 是保存函数；实际运行时指向 `session.append_message`，传入 `None` 时只更新内存。用户输入在 `main()` 中同样先追加到 `history`，再调用 `session.append_message` 保存。
 
 ## 运行
 
