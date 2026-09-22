@@ -18,6 +18,9 @@ dist/
 # Runtime session data
 .sessions/
 
+# Runtime trace data
+.traces/
+
 # IDE and OS files
 .idea/
 .vscode/
