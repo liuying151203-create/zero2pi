@@ -87,13 +87,27 @@ def safe_path(path: str) -> Path:
     return resolved
 
 
-def run_read(path: str, limit: int | None = None) -> str:
-    """读取工作目录内的文本文件，可选限制行数。"""
+def run_read(
+    path: str,
+    limit: int | None = None,
+    start_line: int = 1,
+) -> str:
+    """读取工作区文本文件，可从指定行开始并限制返回行数。"""
     try:
         lines = safe_path(path).read_text(encoding="utf-8").splitlines()
-        if limit is not None and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
+        if start_line < 1:
+            raise ValueError("start_line must be at least 1")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be at least 1")
+
+        # 来自 s02：保持；局部读取仍属于 read_file，只读权限策略无需增加分支。
+        start_index = start_line - 1
+        if start_index >= len(lines):
+            return f"(start_line {start_line} exceeds file length {len(lines)})"
+        selected = lines[start_index:]
+        if limit is not None and limit < len(selected):
+            selected = selected[:limit] + [f"... ({len(selected) - limit} more lines)"]
+        return "\n".join(selected)
     except (OSError, UnicodeError, ValueError) as error:
         return f"Error: {error}"
 
@@ -154,12 +168,16 @@ TOOLS = [
     },
     {
         "name": "read_file",
-        "description": "Read a UTF-8 text file in the current workspace.",
+        "description": (
+            "Read a UTF-8 workspace file. For large files, use one-based start_line "
+            "with limit to read only the needed range."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "limit": {"type": "integer"},
+                "start_line": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1},
             },
             "required": ["path"],
         },

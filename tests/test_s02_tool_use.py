@@ -24,6 +24,22 @@ def test_dispatcher_rejects_unknown_tool_and_path_escape(tmp_path, monkeypatch) 
     assert result.startswith("Error: Path escapes workspace")
 
 
+def test_read_file_supports_a_small_line_range(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(chapter, "WORKDIR", tmp_path)
+    (tmp_path / "code.py").write_text(
+        "\n".join(f"line {number}" for number in range(1, 11)),
+        encoding="utf-8",
+    )
+
+    result = chapter.dispatch_tool(
+        "read_file",
+        {"path": "code.py", "start_line": 4, "limit": 3},
+    )
+
+    assert result == "line 4\nline 5\nline 6\n... (4 more lines)"
+    assert chapter.run_read("code.py", 2) == "line 1\nline 2\n... (8 more lines)"
+
+
 def test_agent_loop_dispatches_multiple_tools_in_order() -> None:
     responses = [
         SimpleNamespace(

@@ -14,6 +14,18 @@ def test_read_only_tools_are_allowed(tmp_path, monkeypatch) -> None:
     )
 
 
+def test_ranged_read_stays_read_only_and_returns_requested_lines(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(chapter, "WORKDIR", tmp_path)
+    (tmp_path / "code.py").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    arguments = {"path": "code.py", "start_line": 2, "limit": 2}
+
+    decision = chapter.check_permission("read_file", arguments)
+    result = chapter.dispatch_tool("read_file", arguments)
+
+    assert decision.status is chapter.PermissionStatus.ALLOW
+    assert result == "two\nthree\n... (1 more lines)"
+
+
 def test_writes_need_confirmation_and_path_escape_is_denied(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(chapter, "WORKDIR", tmp_path)
 

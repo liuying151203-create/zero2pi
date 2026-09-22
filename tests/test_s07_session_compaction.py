@@ -7,6 +7,13 @@ def _message(role: str, content: object) -> chapter.Message:
     return {"role": role, "content": content}
 
 
+def test_system_prefers_ranged_reads_and_does_not_retry_denied_shell_commands() -> None:
+    assert "read_file 的 start_line 和 limit" in chapter.SYSTEM
+    assert "不要改用等价的 shell 命令重复请求" in chapter.SYSTEM
+    read_tool = next(tool for tool in chapter.TOOLS if tool["name"] == "read_file")
+    assert read_tool["input_schema"]["properties"]["start_line"]["minimum"] == 1
+
+
 def test_store_round_trips_message_and_compaction_entries(tmp_path) -> None:
     session = chapter.SessionManager.open(tmp_path / "session.jsonl")
     tail = _message("user", "保留的最新任务")

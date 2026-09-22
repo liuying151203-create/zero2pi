@@ -51,11 +51,12 @@ SUMMARY_TOOL_RESULT_MAX_CHARS = 2000
 Message = previous.Message
 DispatchTool = previous.DispatchTool
 Hooks = previous.Hooks
-# s07 修改：只读分析不自行落地诊断脚本，并在读取日志前先限制范围。
+# s07 修改：只读分析使用专用工具和局部读取，权限拒绝后不换壳重复请求。
 SYSTEM = (
     previous.SYSTEM
     + "检查或分析时优先使用只读工具；除非用户明确要求修改文件，否则不要创建临时脚本。"
-    "读取日志等大文件前先限制范围，信息足够后立即停止。"
+    "读取大文件时使用 read_file 的 start_line 和 limit 只取所需范围。"
+    "工具权限被拒绝后，不要改用等价的 shell 命令重复请求。信息足够后立即停止。"
 )
 TOOLS = previous.TOOLS
 SessionSaver = previous.SessionSaver
