@@ -45,8 +45,12 @@ python -m s07_session_compaction.code --session .sessions\s07\session-20260919-1
 python -m s08_runtime_events.code
 # 加载已有的第八章会话
 python -m s08_runtime_events.code --session .sessions\s08\session-20260922-120000.jsonl
+# 运行第九章：运行时系统 · 流式响应
+python -m s09_runtime_streaming.code
+# 加载已有的第九章会话
+python -m s09_runtime_streaming.code --session .sessions\s09\session-20260922-120000.jsonl
 # 运行测试
 python -m pytest
 # 检查代码规范
-ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session_persistence s06_session_context s07_session_compaction s08_runtime_events src tests
+ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session_persistence s06_session_context s07_session_compaction s08_runtime_events s09_runtime_streaming src tests
 ```
