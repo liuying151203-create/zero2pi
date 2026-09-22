@@ -8,8 +8,9 @@ def _message(role: str, content: object) -> chapter.Message:
 
 
 def test_system_prefers_ranged_reads_and_does_not_retry_denied_shell_commands() -> None:
-    assert "read_file 的 start_line 和 limit" in chapter.SYSTEM
-    assert "不要改用等价的 shell 命令重复请求" in chapter.SYSTEM
+    assert "大文件用 read_file 分段读取" in chapter.SYSTEM
+    assert "工具被拒绝后不要换等价命令重试" in chapter.SYSTEM
+    assert "start_line 和 limit" not in chapter.SYSTEM
     read_tool = next(tool for tool in chapter.TOOLS if tool["name"] == "read_file")
     assert read_tool["input_schema"]["properties"]["start_line"]["minimum"] == 1
 

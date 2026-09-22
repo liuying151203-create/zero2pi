@@ -51,12 +51,12 @@ SUMMARY_TOOL_RESULT_MAX_CHARS = 2000
 Message = previous.Message
 DispatchTool = previous.DispatchTool
 Hooks = previous.Hooks
-# s07 修改：只读分析使用专用工具和局部读取，权限拒绝后不换壳重复请求。
+# s07 修改：系统提示词只保留工具选择原则，参数细节交给工具定义说明。
 SYSTEM = (
     previous.SYSTEM
-    + "检查或分析时优先使用只读工具；除非用户明确要求修改文件，否则不要创建临时脚本。"
-    "读取大文件时使用 read_file 的 start_line 和 limit 只取所需范围。"
-    "工具权限被拒绝后，不要改用等价的 shell 命令重复请求。信息足够后立即停止。"
+    + "分析任务优先使用只读工具；大文件用 read_file 分段读取，"
+    "不要创建临时脚本或改用 shell 截取。"
+    "工具被拒绝后不要换等价命令重试；信息足够后立即停止。"
 )
 TOOLS = previous.TOOLS
 SessionSaver = previous.SessionSaver
