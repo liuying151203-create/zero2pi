@@ -1,94 +1,87 @@
-# s11：运行时系统 · 追踪与用量
+# s11：运行时系统 · 追踪与会话用量
 
-s11 直接复用 s10 的 Provider 和事件边界：Agent 仍按原流程工作，同一份事件额外交给 Trace 和统计消费者。Anthropic、OpenAI 或 DeepSeek 的原始 usage 已由 s10 转成统一 `ModelUsage`，本章不再解析任何 SDK 字段。
+s11 通过 Event 显示运行过程、记录紧凑 Trace 和统计本轮指标；模型用量随对应的会话记录持久化。退出程序后用 `--session` 继续对话，可以从完整会话历史重算累计用量。
 
-## 核心设计
-
-Hook 和 Event 的职责不同：
+## 核心思路
 
 ```text
-Hook  → 在行为发生前后进行阻断或修改
-Event → 报告已经发生的事实，供显示、记录和统计
+普通回答  → MessageEntry：assistant 内容 + model + stop_reason + usage
+摘要压缩  → CompactionEntry：摘要 + 保留尾部 + 生成摘要的 usage
+调用异常  → ModelErrorEntry：没有形成消息的失败调用 + 可获得的 usage
 ```
 
-因此 `UsageTracker` 不注册为工具 Hook。它只消费 `model_response`、`tool_call` 和 `tool_result` 等事件，不会改变消息或工具结果。
+例如一次回答消耗 120 Token，随后摘要请求消耗 70 Token，再次回答消耗 95 Token，三个用量分别保存在产生它们的记录里。恢复会话后遍历全部记录，累计为 285 Token；压缩过的旧回答仍留在 JSONL，因此不会漏算。
+
+`s10` 的 Provider 在 usage 缺失时会给出全零 `ModelUsage`。s11 在自己的请求边界把全零占位解释成“未知”；正常调用至少有输入或输出 Token，所以不会把真实用量当零。失败异常若暴露 `usage`，s11 会保存它；异常没有提供用量时无法从错误文本推算，统计标为未知。
+
+摘要请求返回空文本也会消耗 Token，它作为未生成摘要的调用立即保存到 `ModelErrorEntry`；若随后重试成功，成功那次的用量随 `CompactionEntry` 保存。旧版 s11 会话仍可读取，但旧记录原本未保存 usage，无法追溯真实 Token。
 
 ## 组件关系
 
-| 组件 | 作用 | 主要输入 | 主要输出 |
-|---|---|---|---|
-| `EventDispatcher` | 将一个事件按顺序广播给多个消费者 | `AgentEvent` | 调用所有 `EventSink` |
-| `TerminalEventSink` | 显示流式回答和工具状态 | 运行事件 | 终端文本 |
-| `JsonlTraceRecorder` | 保存紧凑运行记录 | 运行事件 | Trace JSONL |
-| `UsageTracker` | 累计模型、工具、Token 和耗时 | 运行事件 | `RunStats` |
-| s10 `ModelUsage` | 提供统一 Token 字段 | Provider 响应 | 可序列化用量 |
+| 组件 | 职责 | 主要输出 |
+|---|---|---|
+| `EventDispatcher` | 把运行事件广播给观察者 | 终端、Trace、本轮统计 |
+| `UsageTracker` | 消费事件，统计一次自然语言任务 | `RunStats` |
+| `JsonlTraceRecorder` | 保存简短运行轨迹 | Trace JSONL |
+| `SessionManager` | 保存回答、压缩和异常调用 | 会话 JSONL、模型上下文 |
+| `ContextSummarizer` | 生成摘要，记录未产生摘要的尝试 | `SummaryResult` |
+| `ContextCompactor` | 压缩上下文并保存摘要用量 | `CompactionEntry` |
+| `SessionStats` | 遍历全部会话记录，重算调用数、工具调用数和用量 | 会话统计文本 |
 
-完整对话仍保存在 Session JSONL。Trace 不重复保存完整上下文：它跳过 `assistant_delta`，只保存助手消息类型、工具结果长度和最多 500 字符预览等运行信息。
+Trace 只保存运行事实和工具结果预览，不复制完整对话。模型上下文仍由会话投影生成，只含对话消息、最新摘要和保留尾部，不含 usage、模型名称等统计字段。
 
 ## 运行流程
 
 ```mermaid
 flowchart LR
-    A[agent_start] --> B[请求模型]
-    B --> C[model_response + usage]
-    C --> D[assistant_message]
-    D --> E{包含 tool_use?}
-    E -- 是 --> F[tool_call]
-    F --> G[Hooks 与工具执行]
-    G --> H[tool_result + 耗时]
-    H --> B
-    E -- 否 --> I[agent_end]
+    A[用户输入] --> B{需要压缩?}
+    B -- 是 --> C[摘要模型请求]
+    C -- 生成摘要 --> D[保存 CompactionEntry；有模型摘要时附 usage]
+    C -- 空响应或异常 --> J[保存 ModelErrorEntry 与可用用量]
+    J -- 可重试 --> C
+    J -- 回退摘要 --> D
+    B -- 否 --> E[回答模型请求]
+    D --> E
+    E -- 返回响应 --> F[保存 assistant MessageEntry 与回答用量]
+    E -- 抛异常 --> G[保存 ModelErrorEntry 与可用用量]
+    F --> H[从完整会话重算 SessionStats]
+    G --> H
 ```
 
-一次模型请求只在最终响应到达后记录一次 usage。流式 `assistant_delta` 只负责即时展示，不按片段猜测或重复累计 Token。
+同一轮还会发送 `model_request`、`model_response` 或 `model_error` 等事件；`UsageTracker` 用它们生成本轮统计。流式文本片段只负责展示，Token 只在模型调用结束后计一次。
 
 ## 组装结构
 
-箭头统一表示左侧向右侧提供依赖或数据，线上标明实际参数或事件名称；这里只画 s11 新增组件及其直接关联对象。
+箭头统一表示左侧向右侧提供依赖或数据，线上标明实际参数、注册方式或数据名称；只画本章新增组件及其直接关联对象。
 
 ```mermaid
 flowchart TB
-    A[TerminalEventSink] -->|listener| D[EventDispatcher]
-    B[JsonlTraceRecorder] -->|listener| D
-    C[UsageTracker] -->|listener| D
-    D -->|emit: AgentEvent| E[模型请求器]
-    D -->|emit: AgentEvent| F[agent_loop]
-    E -->|model_response.usage| C
-    F -->|tool_call / tool_result| C
+    A[BlockingModelRequester] -->|create_message| B[ContextSummarizer]
+    B -->|summarize: SummaryResult| C[ContextCompactor]
+    D[SessionManager] -->|session| C
+    D -->|session| E[SessionErrorRecorder]
+    D -->|session| F[CompactedContextRequester]
+    C -->|compactor| F
+    G[UsageTracker] -->|listener| H[EventDispatcher]
+    E -->|listener| H
+    I[JsonlTraceRecorder] -->|listener| H
+    H -->|emit| A
+    H -->|emit| F
 ```
 
-图中的三条 `listener` 线含义相同：三个组件作为并列消费者注册进 `EventDispatcher`。它们不是逐层包裹，也不会互相调用。
-
-`main()` 按以下层次显式组装：
-
-```text
-1. 观察层：terminal + trace_recorder + usage_tracker → events
-2. 模型层：summary_requester / assistant_requester → events.emit
-3. 上下文层：session + policy + summarizer → compactor
-4. 请求层：assistant_requester + compactor → request_with_context
-5. 循环层：request_with_context + hooks + events.emit → agent_loop
-```
-
-## Trace 示例
-
-```json
-{"type":"model_response","data":{"purpose":"assistant","usage":{"input_tokens":120,"output_tokens":32,"total_tokens":152}}}
-{"type":"tool_call","data":{"tool_call_id":"tool-1","name":"read_file","arguments":{"path":"README.md"}}}
-{"type":"tool_result","data":{"tool_call_id":"tool-1","name":"read_file","is_error":false,"output_chars":860}}
-```
+`main()` 先打开会话，再组装观察者、两个模型请求器、摘要器和压缩器，最后把 `request_with_context` 与 `session.append_assistant` 传给 `agent_loop`。终端每轮显示“本轮”和“会话累计”两行，后者每次从会话 JSONL 重算模型请求、Token 和工具调用次数。工具耗时与工具错误次数目前只在本轮事件中统计。
 
 ## 运行
 
 ```powershell
-# 新建 s11 会话，同时在 .traces/s11 下创建运行 Trace
+# 新建 s11 会话，并在 .traces/s11 下记录运行轨迹
 python -m s11_runtime_observability.code
 
-# 加载已有的 s11 会话；本次进程仍创建独立 Trace
+# 恢复指定会话；累计用量从该会话文件重新计算
 python -m s11_runtime_observability.code --session .sessions\s11\session-20260922-120000.jsonl
 ```
 
 ## 参考与差异
 
-- Pi 的低层 Agent 发送 message、turn 和 tool execution 事件，Session 再通过订阅完成持久化和统计。s11 保留“运行事实先事件化、观察者再消费”的设计，但暂时只实现当前运行所需事件，避免提前加入并行工具和多 Agent 生命周期。
-- Pi 将 usage 保存在 assistant message 和 Session Entry 中，可统计完整会话成本。s11 复用 s10 的统一 usage，但为了不修改 s06 的教学会话格式，先把它写入独立 Trace。
-- lcc 更强调每章直接展示新增 Agent 能力。s11 延续其单章单机制和可运行示例，但把可观测性作为 Harness 运行时能力，而不是写入系统提示词或工具实现。
+- Pi 把回答用量放在 assistant 消息、摘要用量放在 compaction entry，并遍历完整会话统计。s11 采用相同的归属方式；本项目摘要重试产生的空响应，以及无消息的调用异常，用 `ModelErrorEntry` 保留用量。
+- lcc 用小章节逐步展示 Agent 机制。s11 延续这种可运行的章节结构；Event 负责运行观察，Session 保存可恢复的完整事实，两者各有明确用途。
