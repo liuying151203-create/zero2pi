@@ -53,8 +53,10 @@ python -m s09_runtime_streaming.code --session .sessions\s09\session-20260922-12
 python -m s10_model_provider.code
 # 运行第十一章：运行时系统 · 追踪与用量
 python -m s11_runtime_observability.code
+# 运行第十二章：能力系统 · Skills 按需加载
+python -m s12_skill_loading.code
 # 运行测试
 python -m pytest
 # 检查代码规范
-ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session_persistence s06_session_context s07_session_compaction s08_runtime_events s09_runtime_streaming s10_model_provider s11_runtime_observability src tests
+ruff check s01_agent_loop s02_tool_use s03_permission s04_hooks s05_session_persistence s06_session_context s07_session_compaction s08_runtime_events s09_runtime_streaming s10_model_provider s11_runtime_observability s12_skill_loading src tests
 ```
