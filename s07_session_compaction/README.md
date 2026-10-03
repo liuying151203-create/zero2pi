@@ -14,9 +14,8 @@ flowchart LR
     F --> G[截断摘要输入中的巨型工具结果]
     G --> H{模型返回摘要文本?}
     H -- 是 --> I[更新旧摘要]
-    H -- 否 --> J[提取已有摘要和用户原文作为 fallback]
+    H -- 否 --> J[停止任务，保留原始会话]
     I --> K[复核并限制压缩后大小]
-    J --> K
     K --> L[追加 CompactionEntry]
     L --> C
 ```
@@ -32,6 +31,7 @@ MessageEntry ... → CompactionEntry(summary + retained_tail) → active_context
 ```mermaid
 flowchart TB
     A[ModelRequester] -->|create_message| D[ContextSummarizer]
+    O[SUMMARY_REQUEST_OPTIONS] -->|request_options 默认值| D
     B[SessionManager] -->|entries| P["prepare_compaction()"]
     C[CompactionPolicy] -->|policy| P
     P -->|CompactionPlan| E[ContextCompactor]
@@ -89,7 +89,13 @@ SESSION_COMPACTION_SUMMARY_MAX_TOKENS=1024
 
 `SESSION_COMPACTION_MAX_CHARS` 使用字符数近似上下文大小，便于直接观察和测试；它不是精确 token 计数。`SESSION_COMPACTION_KEEP_RECENT_CHARS` 必须小于等于总阈值的一半，为摘要留出空间。
 
-若摘要响应只有 `thinking`、没有最终文本，s07 会自动以至少 1024 token 重试一次。仍未取得文本时，fallback 会保留已有摘要、摘要区最近三条用户原文和完整 JSONL 路径。摘要写入前会再次计算压缩后大小，必要时添加明确标记并裁剪摘要，保证结果不超过阈值。
+摘要与正常任务的目标不同：摘要只需要最终正文，不需要继续分析或调用工具。s07 为 Anthropic 摘要请求默认传入 `thinking: {"type": "disabled"}`；该选项只在 `summarize_context()` 内使用，正常 `agent_loop()` 不携带它。[Messages API 的 thinking 参数](https://platform.claude.com/docs/en/api/http/messages)
+
+`ContextSummarizer.request_options` 可以覆盖默认选项。s07–s09 直接使用 Anthropic；从 s10 起由 Provider 层选择本接口适用的选项，避免给 Chat Completions 发送 Anthropic 专有字段。
+
+输出额度小于 1024 且没有正文时，仍只重试一次至 1024；不自动扩大已配置的高额度。重试后仍无正文，压缩器会停止任务，原始消息与上下文保持不变，不写入只有用户要求和历史路径的回退摘要。成功摘要写入前仍复核大小，必要时明确标记并裁剪。
+
+注意：参数支持取决于模型与兼容服务，协议里有 `disabled` 不代表每个后端都接受或遵守它。s11 增加空摘要结构诊断，s12 直接复用；如果关闭参数已发送但仍只有思考，应检查服务支持情况，而不是把思考当摘要或无限提高额度。相关复现与证据见 [B009](../docs/bug-log.md#b009摘要额度提高后仍无正文缺少响应结构证据)。
 
 ## 测试压缩
 
@@ -111,4 +117,5 @@ SESSION_COMPACTION_KEEP_RECENT_CHARS=400
 ## 参考与差异
 
 - Pi 先用 `prepareCompaction` 明确旧摘要、待总结消息和保留尾部，再执行模型摘要。s07 保留这个两阶段设计，并把结果保存为会话 Entry；预算使用更容易观察的字符数，摘要输入仍会截断巨型工具结果。
+- Pi 在摘要请求边界独立组织 reasoning 参数，不把技能章节作为摘要策略入口。s07 同样独立组织摘要选项；s10 适配接口差异，s11 验证失败诊断与用量，s12 复用这些组件。这里明确发送 `disabled`，不声称所有模型都能关闭思考。
 - lcc 使用工具输出持久化、裁剪、微压缩和手动压缩等多层管线。本章只实现会话摘要这一条自动路径，避免在同一章节混入多种压缩策略。

@@ -25,6 +25,7 @@ OpenAI Chat Completions 使用 `assistant.tool_calls` 和独立 `tool` 消息；
 | `OpenAIChatProvider` | 转换 Chat 消息、工具和流增量 | 内部消息和工具 | `ModelResponse` |
 | `BlockingModelRequester` | 服务内部摘要 | `ModelProvider` | 完整响应 |
 | `StreamingModelRequester` | 服务正常回答 | `ModelProvider` | 文本增量 + 完整响应 |
+| `summary_request_options()` | 选择摘要专用参数 | 当前 Provider | 与接口匹配的参数字典 |
 
 内部 `content` 继续使用：
 
@@ -34,6 +35,15 @@ OpenAI Chat Completions 使用 `assistant.tool_calls` 和独立 `tool` 消息；
 ```
 
 因此历史会话保存的是 Harness 内部格式。切换 Provider 后可以加载同一份 s10 会话；发送请求时由当前 Provider 转换为自己的协议。
+
+摘要请求策略来自 s07，接口参数由 s10 选择：`AnthropicProvider` 使用 `thinking: {"type": "disabled"}`；`OpenAIChatProvider` 使用空选项，不猜测所有兼容服务都支持某种关闭思考字段。`main()` 先创建 `summary_options`，再通过 `ContextSummarizer(request_options=summary_options)` 注入；正常回答不携带这些选项。相同模型名不代表相同 API，判断依据是 Provider 类型。
+
+```text
+provider → summary_request_options(provider) → summary_options
+summary_options --request_options--> summarizer
+```
+
+这只是请求策略，不保证兼容服务一定支持关闭思考；服务拒绝参数时保留实际错误，不自动删除参数后重复计费请求。
 
 ## 运行流程
 

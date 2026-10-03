@@ -27,6 +27,8 @@ s11 通过 Event 显示运行过程、记录紧凑 Trace 和统计本轮指标�
 | `ContextSummarizer` | 生成摘要，记录未产生摘要的尝试 | `SummaryResult` |
 | `ContextCompactor` | 压缩上下文并保存摘要用量 | `CompactionEntry` |
 | `SessionStats` | 遍历全部会话记录，重算调用数、工具调用数和用量 | 会话统计文本 |
+| `_summary_response_details()` | 统计空摘要的响应结构，不记录原文 | 类型、长度、停止原因、请求选项与用量 |
+| `show_summary_diagnostic()` | 消费空摘要事件显示诊断 | 一行终端信息 |
 
 Trace 只保存运行事实和工具结果预览，不复制完整对话。模型上下文仍由会话投影生成，只含对话消息、最新摘要和保留尾部，不含 usage、模型名称等统计字段。
 
@@ -39,7 +41,7 @@ flowchart LR
     C -- 生成摘要 --> D[保存 CompactionEntry；有模型摘要时附 usage]
     C -- 空响应或异常 --> J[保存 ModelErrorEntry 与可用用量]
     J -- 可重试 --> C
-    J -- 回退摘要 --> D
+    J -- 无正文或不可重试 --> K[停止任务，保留原始会话]
     B -- 否 --> E[回答模型请求]
     D --> E
     E -- 返回响应 --> F[保存 assistant MessageEntry 与回答用量]
@@ -67,9 +69,38 @@ flowchart TB
     I[JsonlTraceRecorder] -->|listener| H
     H -->|emit| A
     H -->|emit| F
+    P[s10 summary_request_options] -->|request_options: summary_options| B
+    B -->|summary_empty: response_details| H
+    H -->|事件；观察者通过 subscribe 注册| Q[show_summary_diagnostic]
 ```
 
 `main()` 先打开会话，再组装观察者、两个模型请求器、摘要器和压缩器，最后把 `request_with_context` 与 `session.append_assistant` 传给 `agent_loop`。终端每轮显示“本轮”和“会话累计”两行，后者每次从会话 JSONL 重算模型请求、Token 和工具调用次数。工具耗时与工具错误次数目前只在本轮事件中统计。
+
+## 摘要请求与失败诊断
+
+空摘要是 s07 压缩机制的问题边界，不是 s12 的技能加载机制。s11 沿用 s07 的摘要专用选项，由 s10 Provider 层按接口选择；不会给正常任务关闭思考。摘要失败时先记录失败用量，再停止任务，不写回退压缩记录。
+
+`ContextSummarizer` 在原有 `summary_empty` 事件中附加 `response_details`；`show_summary_diagnostic` 与 `trace_recorder` 接收同一个事件，统计器只计一次失败。元数据包含 Provider 转换后的内容块类型、正文/思考/提取正文长度、未知块字段名与字符串长度、停止原因、实际额度、用量和 `requested_thinking`。不记录正文、思考原文或签名。
+
+示意输出：
+
+```text
+摘要诊断  停止=max_tokens；额度=4096 tokens；请求思考=disabled；内容块=thinking；正文=0 字符；思考=15000 字符；提取正文=0 字符。
+```
+
+- 只有 `thinking`、正文为 0、额度用尽：最终摘要尚未出现。
+- `requested_thinking=disabled` 仍返回只有思考：关闭参数已发送，但当前兼容服务未按预期返回正文，需要核对服务支持情况。
+- 出现未知内容块：检查响应结构及解析规则；不能直接当作摘要。
+- 内容块为空：这里只知道转换后的响应为空，仍需检查 Provider 转换及上游返回。
+
+单次自然语言任务最多 12 轮回答请求（不计摘要请求）；耗尽上限时报未完成，保留已经执行的工具结果。请求失败同样发出结束事件。s12 复用这套运行时保护，同时保留自己的完整循环源码供阅读。
+
+查看当前章节最新 Trace 的诊断（运行 s12 时将路径改为 `.traces\s12\*.jsonl`）：
+
+```powershell
+$summaryTrace = Get-ChildItem .traces\s11\*.jsonl | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+Get-Content -LiteralPath $summaryTrace.FullName -Encoding utf8 | ForEach-Object { ConvertFrom-Json $_ } | Where-Object { $_.type -eq 'summary_empty' } | Select-Object -ExpandProperty data | ConvertTo-Json -Depth 8
+```
 
 ## 运行
 

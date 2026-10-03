@@ -40,6 +40,8 @@ from zero2pi.ui import (
 # s11 修改：会话和 Trace 按章节隔离，便于分别检查模型上下文与运行事实。
 SESSION_ROOT = Path(".sessions/s11")
 TRACE_ROOT = Path(".traces/s11")
+# s11 修复：运行时限制单次任务的回答请求轮数，后续章节复用，不绑定技能机制。
+MAX_MODEL_ROUNDS = 12
 
 # ===== 来自 s10：Provider、Agent、工具与会话依赖（保持） =====
 # s11 保留工具与 Hooks；会话 Entry 在下方增加用量字段。
@@ -58,6 +60,8 @@ dispatch_tool = previous.dispatch_tool
 execute_tool = previous.execute_tool
 make_permission_hook = previous.make_permission_hook
 create_model_provider = previous.create_model_provider
+# 来自 s10：保持；接口参数由 Provider 层选择，运行时只负责传递。
+summary_request_options = previous.summary_request_options
 _positive_int_env = previous._positive_int_env
 
 # ===== s11 新增：会话中的模型用量 =====
@@ -860,27 +864,109 @@ class SummaryResult:
     usage: ModelUsage | None
 
 
-# s11 修改：相对 s07，空摘要立即记录为无可用摘要的调用。
+# s11 新增：诊断只收集结构与长度，避免把摘要正文或思考内容复制到 Trace。
+def _summary_response_details(
+    response: ModelResponse, summary: str, max_tokens: int, request_options: dict[str, Any]
+) -> dict[str, Any]:
+    """统计 Provider 转换后的内容块；未知块只记录字段名和字符串长度。"""
+    content = response.content
+    blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content
+    content_types: list[str] = []
+    text_chars = 0
+    thinking_chars = 0
+    other_blocks: list[dict[str, Any]] = []
+    for block in blocks:
+        block_type = str(_get(block, "type") or "unknown")
+        content_types.append(block_type)
+        if block_type == "text":
+            text_chars += len(str(_get(block, "text") or ""))
+        elif block_type in {"thinking", "reasoning"}:
+            thinking = (
+                _get(block, "thinking")
+                or _get(block, "reasoning_content")
+                or _get(block, "text")
+                or ""
+            )
+            thinking_chars += len(str(thinking))
+        else:
+            fields = block if isinstance(block, dict) else {}
+            other_blocks.append(
+                {
+                    "type": block_type,
+                    "fields": sorted(fields),
+                    "string_chars": sum(
+                        len(value) for value in fields.values() if isinstance(value, str)
+                    ),
+                }
+            )
+    # s11 新增：明确诊断发生在 Provider 转换之后，空内容不能证明 SDK 原始响应为空。
+    usage = _known_usage(response.usage)
+    return {
+        "response_stage": "normalized",
+        "stop_reason": response.stop_reason,
+        "max_tokens": max_tokens,
+        "requested_thinking": _get(request_options.get("thinking"), "type"),
+        "usage": usage.to_dict() if usage is not None else None,
+        "content_types": content_types,
+        "text_chars": text_chars,
+        "thinking_chars": thinking_chars,
+        "extracted_text_chars": len(summary),
+        "other_blocks": other_blocks,
+    }
+
+
+# s11 新增：注册一个轻量观察者显示诊断，摘要组件不直接打印终端文案。
+def show_summary_diagnostic(event: AgentEvent) -> None:
+    """显示空摘要的结构证据，不显示正文或思考原文。
+
+    输入：现有 EventDispatcher 广播的事件；只处理含诊断的 summary_empty。
+    输出：一行终端诊断，其他事件不产生输出。
+    流程：读取结构元数据 → 显示停止原因、请求额度与内容长度；完整元数据由 Trace 保存。
+    """
+    if event.type != "summary_empty" or "response_details" not in event.data:
+        return
+    details = event.data["response_details"]
+    print(
+        f"摘要诊断  停止={details['stop_reason']}；额度={details['max_tokens']} tokens；"
+        f"请求思考={details['requested_thinking'] or '接口默认'}；"
+        f"内容块={','.join(details['content_types']) or '无'}；"
+        f"正文={details['text_chars']} 字符；思考={details['thinking_chars']} 字符；"
+        f"提取正文={details['extracted_text_chars']} 字符。",
+        flush=True,
+    )
+
+
+# s11 修改：保留 s07 摘要策略，在空响应丢弃前记录结构与失败用量。
 @dataclass(frozen=True)
 class ContextSummarizer:
-    """请求模型更新会话摘要，并保存没有生成摘要的调用。
+    """生成摘要并记录请求结果；失败时停止，保留原始会话证据。
 
-    输入：待总结消息、上一份摘要、摘要请求器、会话和输出上限。
-    输出：可用摘要及其模型与用量；请求均无文本时返回空结果。
-    流程：序列化消息 → 请求摘要 → 无文本时记录失败调用 → 必要时重试。
+    输入：待总结消息、旧摘要、请求器、会话、事件出口与摘要专用参数。
+    输出：成功时返回 s11 SummaryResult；无文本时发出诊断，抛出 RuntimeError 给入口。
+    流程：组装摘要请求 → 提取正文 → 成功返回，或保存失败用量并报告结构诊断。
+    边界：空摘要仍采用 s07 的停止策略，不写 CompactionEntry；诊断不记录原文。
     """
 
     create_message: Callable[..., ModelResponse]
     max_tokens: int
     session: SessionManager
     emit: EventSink
+    # 来自 s07：保持；参数只用于摘要，由 s10 Provider 层按接口选择。
+    request_options: dict[str, Any] | None = None
 
     def __call__(
         self,
         messages_to_summarize: Sequence[Message],
         previous_summary: str | None,
     ) -> SummaryResult:
-        """按 s07 的提示词生成摘要，空响应的用量立即进入失败记录。"""
+        """使用待总结消息和旧摘要生成 SummaryResult，并记录失败请求的用量。
+
+        输入：尚未摘要的消息与可选旧摘要；请求依赖已在构造时注入。
+        输出：含正文和成功请求用量的 SummaryResult；无正文时抛出 RuntimeError。
+        流程：组装请求 → 提取正文 → 成功返回；失败先保存用量，再发出诊断并停止。
+        本方法不写压缩记录；只有压缩器拿到有效摘要后才更新会话。
+        """
+        # 来自 s07：保持；沿用消息序列化与专用摘要提示词。
         transcript = s07.serialize_context_for_summary(messages_to_summarize)
         previous_section = (
             f"<previous-summary>\n{previous_summary}\n</previous-summary>\n\n"
@@ -889,10 +975,14 @@ class ContextSummarizer:
         )
         prompt = (
             f"{previous_section}<unsummarized-messages>\n{transcript}\n"
-            "</unsummarized-messages>\n\n"
-            "请生成更新后的完整摘要。"
+            "</unsummarized-messages>\n\n请生成更新后的完整摘要。"
         )
+        # 来自 s07：保持；不足 1024 时仅重试一次，不自动放大已配置的高额度。
         token_limits = [self.max_tokens]
+        # 来自 s07：保持；不向正常回答请求传递摘要的专用选项。
+        options = (
+            s07.SUMMARY_REQUEST_OPTIONS if self.request_options is None else self.request_options
+        )
         if self.max_tokens < 1024:
             token_limits.append(1024)
         for token_limit in token_limits:
@@ -901,21 +991,29 @@ class ContextSummarizer:
                 messages=[{"role": "user", "content": prompt}],
                 tools=[],
                 max_tokens=token_limit,
+                **options,
             )
             summary = s05._text_from_content(response.content).strip()
-            # s11 修改：错误/中断响应即使带有部分文本，也不能作为可信摘要。
+            # s11 修改：错误或中断响应即使带部分正文，也不能作为可信摘要。
             if summary and response.stop_reason not in {"error", "aborted"}:
                 return SummaryResult(summary, response.model, _known_usage(response.usage))
-            # s11 新增：空摘要没有对应的压缩结果，立即保存其已知或未知用量。
-            self.session.append_model_error(
-                response.model,
-                "summary",
-                _known_usage(response.usage),
-            )
+
+            # s11 新增：每次未形成摘要的请求只持久化一次用量。
+            self.session.append_model_error(response.model, "summary", _known_usage(response.usage))
             if response.stop_reason not in {"error", "aborted"}:
-                # s11 新增：错误状态已经由 model_response 计过失败次数，避免重复。
-                self.emit(AgentEvent(type="summary_empty", data={"model": response.model}))
-        return SummaryResult(None, None, None)
+                # s11 新增：扩充原有事件，Trace 自动保存诊断，统计器仍只计一次失败。
+                details = _summary_response_details(response, summary, token_limit, options)
+                self.emit(
+                    AgentEvent(
+                        type="summary_empty",
+                        data={"model": response.model, "response_details": details},
+                    )
+                )
+        # s11 修复：仍在压缩落盘之前停止；诊断不将 thinking 当作摘要，也不改变预算。
+        raise RuntimeError(
+            "摘要模型未返回正文，已停止本次任务，原始会话仍保留；"
+            "不会用缺少代码证据的回退摘要继续重复调用工具。"
+        )
 
 
 # s11 修改：相对 s07，压缩器把成功摘要的用量随 CompactionEntry 落盘。
@@ -924,7 +1022,7 @@ class ContextCompactor:
 
     输入：会话、压缩策略和返回 SummaryResult 的摘要器。
     输出：未触发压缩时返回 None；触发后返回压缩前后大小等结果。
-    流程：准备计划 → 调用摘要器 → 必要时回退 → 限制长度 → 保存摘要与用量。
+    流程：准备计划 → 调用摘要器 → 拒绝空摘要 → 限制长度 → 保存摘要与用量。
     """
 
     def __init__(
@@ -945,15 +1043,10 @@ class ContextCompactor:
 
         summary_result = self.summarize(plan.messages_to_summarize, plan.previous_summary)
         if summary_result.text is None:
-            summary = s07._fallback_summary(
-                self.session.path,
-                plan.messages_to_summarize,
-                plan.previous_summary,
-            )
-            summary_kind: Literal["model", "fallback"] = "fallback"
-        else:
-            summary = summary_result.text
-            summary_kind = "model"
+            # 来自 s07：保持；空摘要不能覆盖上下文，保留原始会话并停止。
+            raise RuntimeError("摘要模型未返回正文，已停止本次任务，原始会话仍保留。")
+        summary = summary_result.text
+        summary_kind = "model"
 
         summary = s07._fit_summary_to_budget(
             summary,
@@ -1045,38 +1138,51 @@ def agent_loop(
     save_assistant: AssistantSaver | None = None,
     tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 8000,
+    # s11 新增：实际工具循环需要停止边界，避免模型反复搜索造成无限请求。
+    max_rounds: int = MAX_MODEL_ROUNDS,
 ) -> list[Message]:
-    """运行可追踪、可统计的流式多工具 Agent 循环。
+    """运行带工具调用、会话保存和事件观察的 Agent 循环。
 
-    作用：保持 s10 的 Provider—工具闭环，并为一次任务发出完整的运行事实。
-    输入：消息、模型请求函数、工具分发、系统提示词、Hooks、EventSink 和两类保存函数。
-    输出：包含本次执行过程的完整消息列表；模型不再调用工具时返回。
-    流程：agent_start → 模型最终响应 → 保存 assistant → 工具调用及计时
-    → 保存 tool_result → 继续请求；无工具调用时发送 agent_end。
+    输入：模型消息、请求器、工具分发器、system、Hooks 和保存回调。
+    输出：本次运行的完整消息；没有工具调用或模型返回失败状态时结束，超限时报错。
+    流程：请求模型 → 保存 assistant 与 usage → 执行工具 → 保存结果 → 再次请求。
+    事件观察与失败停止由运行时负责，不绑定某项技能或具体任务。
     """
-    # s11 新增：每次自然语言任务都有明确起点，统计器可在此重置本轮指标。
+    # s11 修复：轮数只计算回答请求；摘要由请求包装器负责，不隐含在计数中。
+    if max_rounds < 1:
+        raise ValueError("max_rounds 必须为正整数")
     emit(AgentEvent(type="agent_start", data={"message_count": len(messages)}))
 
-    while True:
-        response = create_message(
-            system=system,
-            messages=messages,
-            tools=tools or TOOLS,
-            max_tokens=max_tokens,
-        )
+    for _ in range(max_rounds):
+        # s11 修复：摘要或回答请求失败同样结束本次任务，观察者不会收到悬空生命周期。
+        try:
+            response = create_message(
+                system=system,
+                messages=messages,
+                tools=tools or TOOLS,
+                max_tokens=max_tokens,
+            )
+        except (RuntimeError, ValueError):
+            emit(
+                AgentEvent(
+                    type="agent_end",
+                    data={"messages": list(messages), "reason": "request_failed"},
+                )
+            )
+            raise
         assistant_message = {
             "role": "assistant",
             "content": s05._to_jsonable(response.content),
         }
         messages.append(assistant_message)
-        # s11 修改：assistant 内容与 ModelResponse 的 usage 同时写入会话。
+        # s11 修改：assistant 内容与响应中的已知用量一起保存，不因请求失败丢掉用量。
         if save_assistant is not None:
             save_assistant(assistant_message, response)
         elif save_message is not None:
             save_message(assistant_message)
         emit(AgentEvent(type="assistant_message", data={"message": assistant_message}))
 
-        # s11 修改：Pi 的失败响应也有用量；已保存消息后结束本轮，不执行其工具块。
+        # s11 修改：失败响应保存后结束任务，不执行其中尚未完成的工具块。
         if response.stop_reason in {"error", "aborted"}:
             emit(AgentEvent(type="agent_end", data={"messages": list(messages)}))
             return messages
@@ -1093,19 +1199,15 @@ def agent_loop(
             tool_call_id = str(_get(block, "id") or "")
             name = str(_get(block, "name") or "")
             arguments = _get(block, "input") or {}
-            # s11 修改：工具 ID 进入事件，Trace 可以准确配对调用与结果。
+            # s11 修改：工具 ID 进入事件，Trace 可以配对调用与结果。
             emit(
                 AgentEvent(
                     type="tool_call",
-                    data={
-                        "tool_call_id": tool_call_id,
-                        "name": name,
-                        "arguments": arguments,
-                    },
+                    data={"tool_call_id": tool_call_id, "name": name, "arguments": arguments},
                 )
             )
 
-            # s11 新增：只在工具执行边界计时，不让计时逻辑进入具体 handler。
+            # s11 新增：只在执行边界计时，不让统计职责进入具体工具。
             tool_started_at = perf_counter()
             output = execute_tool(name, arguments, dispatch=dispatch, hooks=hooks)
             tool_duration_ms = (perf_counter() - tool_started_at) * 1000
@@ -1121,18 +1223,21 @@ def agent_loop(
                     },
                 )
             )
-            results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_call_id,
-                    "content": output,
-                }
-            )
+            results.append({"type": "tool_result", "tool_use_id": tool_call_id, "content": output})
 
         tool_message = {"role": "user", "content": results}
         messages.append(tool_message)
         if save_message is not None:
             save_message(tool_message)
+
+    # s11 修复：保留已完成工具结果并报告未完成，不伪造一次模型最终回答。
+    emit(
+        AgentEvent(
+            type="agent_end",
+            data={"messages": list(messages), "reason": "max_rounds"},
+        )
+    )
+    raise RuntimeError(f"已达到 {max_rounds} 轮模型请求上限，任务尚未完成；已停止自动调用工具。")
 
 
 # ===== s11 修改：按观察层、模型层、上下文层和循环层显式组装 =====
@@ -1172,6 +1277,8 @@ def main(arguments: Sequence[str] | None = None) -> None:
     events.subscribe(trace_recorder)
     events.subscribe(usage_tracker)
     events.subscribe(error_recorder)
+    # s11 新增：诊断作为独立观察者接入同一事件链，不参与用量计算。
+    events.subscribe(show_summary_diagnostic)
 
     # s11 修改：摘要和正常回答都向同一个分发器报告请求完成与 usage。
     summary_requester = BlockingModelRequester(
@@ -1191,11 +1298,15 @@ def main(arguments: Sequence[str] | None = None) -> None:
         keep_recent_chars=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_CHARS", 12000),
     )
     summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
+    # 来自 s10：保持；根据真实接口选择摘要选项，不用模型名字猜测 API 参数。
+    summary_options = summary_request_options(provider)
     summarizer = ContextSummarizer(
         create_message=summary_requester,
         max_tokens=summary_max_tokens,
         session=session,
         emit=events.emit,
+        # 来自 s07：保持；选项只传入摘要，不改变主 Agent 请求。
+        request_options=summary_options,
     )
     compactor = ContextCompactor(session=session, policy=policy, summarize=summarizer)
     request_with_context = CompactedContextRequester(

@@ -23,9 +23,6 @@ s12 在 s11 基础上加入技能目录。启动时只把名称、描述和 `SKI
 | `build_system_prompt()` | 基础 `SYSTEM`、目录 | 生成含目录的 `system_prompt` |
 | `read_file()` | 路径、起始行、行数 | 返回有界代码窗口及继续位置 |
 | `dispatch_tool()` | 已通过 Hooks 的工具调用 | 读取用本章窗口；其他工具复用 s11，超长结果存档 |
-| `ContextSummarizer` | s11 摘要依赖、待总结消息 | 沿用 s11 请求规则；空摘要记录结构诊断并停止，不落盘回退压缩 |
-| `_summary_response_details()` | 转换后的模型响应 | 只统计内容块类型和长度，不保存原文 |
-| `show_summary_diagnostic()` | `summary_empty` 事件 | 显示诊断；作为观察者注册，不参与模型请求或统计 |
 
 `main()` 是组装入口：先获得 `skill_catalog`，再生成 `system_prompt`，最后通过 `agent_loop(system=system_prompt)` 传给回答请求器。摘要请求仍使用 s07 的专用摘要提示词。
 
@@ -58,16 +55,9 @@ flowchart LR
     F[本章 dispatch_tool] -->|dispatch| E
     G[read_file 有界窗口] -->|读取结果| F
     H[s11 工具分发] -->|其他工具结果| F
-    I[summary_requester] -->|create_message| J[ContextSummarizer: summarizer]
-    J -->|summarize| K[ContextCompactor: compactor]
-    K -->|compactor| L[request_with_context]
-    L -->|create_message| E
-    J -->|summary_empty: response_details| M[events]
-    M -->|subscribe: show_summary_diagnostic| N[终端诊断观察者]
-    M -->|subscribe: trace_recorder| O[JSONL Trace]
 ```
 
-`SkillCatalog` 没有装进压缩器或请求器；它只用于组装系统提示词。本章显式展开完整 `agent_loop`，增加轮数上限；Hooks、会话和统计继续复用 s11。`summarizer` 继承 s11 的构造参数，显式展开摘要流程以取得失败响应结构，不额外增加请求包装层。诊断扩充现有 `summary_empty` 事件，观察者和 Trace 接收同一份数据，不重复计费。
+`SkillCatalog` 没有装进压缩器或请求器；它只用于组装系统提示词。Hooks、会话、摘要器、诊断和轮数保护均复用 s11；本章仍显式展开完整 `agent_loop` 便于阅读，不另写摘要实现。运行时的结构图与诊断说明见 s11。
 
 ## 技能文件
 
@@ -119,7 +109,7 @@ python -m pytest tests/test_s12_skill_loading.py
 
 - **技能说明**：限定审查范围，按行窗口读取，只为具体疑点补读关联代码；信息不足时明确说明，不无限搜索。
 - **工具返回**：`read_file` 每次最多 80 行、4000 字符正文，两个预算先到者生效。未读完时附上准确的下一行。超大单行报告限制，不跳过它。其他工具超过 4000 字符时，全文保存到 `.sessions/s12/tool-results/*.txt`，JSONL 和模型只收到预览及路径。说明文字不计入正文预算。
-- **失败停止**：单次任务最多 12 轮回答请求（不计摘要请求），超限报告“任务尚未完成”并返回交互入口。摘要没有正文时直接停止，原始消息与失败用量保留，不写入丢失代码证据的回退压缩记录。
+- **失败停止（复用）**：s11 的运行时最多允许 12 轮回答请求（不计摘要请求）；s07 的摘要机制拒绝空摘要覆盖上下文。s12 使用同一策略，超限或摘要失败时停止，保留原始记录。
 
 ```text
 技能约束读取范围 → 工具返回有界证据 → 模型审查并回答
@@ -127,41 +117,19 @@ python -m pytest tests/test_s12_skill_loading.py
               空摘要 / 轮数耗尽 → 明确报错并停止
 ```
 
-这不是 shell 沙箱，也不能保证模型永远不选 bash：shell 仍会先生成完整输出；每轮还可能包含多个工具调用。工具边界限制进入上下文的内容，轮数边界防止无限运行。这里只改变 s12，s07/s11 的回退策略不变。
+这不是 shell 沙箱，也不能保证模型永远不选 bash：shell 仍会先生成完整输出；每轮还可能包含多个工具调用。工具窗口在本章返回边界限制内容；摘要失败与轮数保护属于前面章节，不属于 Skills 的新增机制。
 
 复测建议直接新建对话，不加载已经反复压缩的旧会话。离线测试验证预算、继续位置、输出存档、空摘要停止和轮数上限；没有代替真实模型的任务完成率验证。
 
 ## 空摘要怎么定位
 
-输出额度从 1024 提高到 4096 后，实际运行仍出现 `max_tokens` 且正文为空，见 [B009](../docs/bug-log.md#b009摘要额度提高后仍无正文缺少响应结构证据)。不能只靠增加额度判断根因；s12 在提取不到摘要时，记录 Provider 转换后的内容结构。
+摘要策略属于 s07，接口参数属于 s10，诊断属于 s11；s12 只复用。默认 Anthropic 摘要请求显式关闭思考，正常任务保持原样；空摘要的结构诊断与解释见 [s11：摘要请求与失败诊断](../s11_runtime_observability/README.md#摘要请求与失败诊断)，复现证据见 [B009](../docs/bug-log.md#b009摘要额度提高后仍无正文缺少响应结构证据)。
 
-再次启动并输入原来的审查任务；若摘要仍失败，错误前会出现类似下面的**示意输出**：
-
-```text
-摘要诊断  停止=max_tokens；额度=4096 tokens；内容块=thinking；正文=0 字符；思考=15000 字符；提取正文=0 字符。
-```
-
-这里的字符数不是 Token 数；终端显示停止原因、实际请求额度和内容长度，Trace 的 `summary_empty.data.response_details` 还包含实际用量，以及未知内容块的字段名和字符串长度。只记录元数据，不记录正文、思考原文或签名。
-
-| 观察到的证据 | 可以判断什么 |
-|---|---|
-| 只有 `thinking`，`thinking_chars>0`，`text_chars=0`，停止原因为 `max_tokens` | 转换后的响应只有思考，最终正文未出现；支持“思考耗尽额度”的判断 |
-| `other_blocks` 中有未知类型及字符串内容 | 检查内容结构与解析规则，不直接把未知块或思考当摘要 |
-| `text_chars>0`，`extracted_text_chars=0`，正文只有空白 | 响应包含 text 块，但去空白后不是可用摘要 |
-| `content_types=[]` | 转换后的响应为空；还需检查 SDK 原始返回及 Provider 转换，不能断言服务没有返回内容 |
-
-查看最新 Trace 的诊断：
-
-```powershell
-$summaryTrace = Get-ChildItem .traces\s12\*.jsonl | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-Get-Content -LiteralPath $summaryTrace.FullName -Encoding utf8 | ForEach-Object { ConvertFrom-Json $_ } | Where-Object { $_.type -eq 'summary_empty' } | Select-Object -ExpandProperty data | ConvertTo-Json -Depth 8
-```
-
-成功摘要不产生空摘要诊断；请求超时或异常仍走原有 `model_error`。此阶段不调整预算、不关闭思考、不切换模型，也不追溯补写旧响应；先获得新证据，再针对实际返回处理。
+新建对话再运行原审查任务。如果仍失败，把“摘要诊断”一行及终端显示的 Trace 路径保留下来：特别检查 `请求思考=disabled` 是否仍收到只有 `thinking` 的响应，这表示需要核对兼容服务支持情况，不应继续盲目增加预算。
 
 ## 参考与差异
 
 - lcc 的 Skill Loading 通过目录减少固定上下文，再用 `load_skill` 返回正文。s12 保留渐进加载流程，复用 `read_file`，减少专用工具和分发分支；本章离线测试验证正文确实进入后续模型请求。
 - Pi 提供名称、描述、路径，并用已有读取能力加载技能。s12 保留这个边界，只扫描本章项目内的单层目录；不引入多来源资源合并。扫描阶段只读取 YAML，技能正文不缓存。
-- Pi 的读文件和 shell 工具在返回阶段限制输出，并提供继续读取或完整输出路径，避免超大结果占用模型上下文。s12 保留这个设计，采用适合当前 24,000 字符压缩阈值的更小预算；本章测试验证窗口可继续、完整 shell 输出可找回。12 轮上限与空摘要停止是本项目的安全兜底，不宣称与 Pi 的失败策略相同。
+- Pi 的读文件和 shell 工具在返回阶段限制输出，并提供继续读取或完整输出路径，避免超大结果占用模型上下文。s12 保留这个设计，采用适合当前 24,000 字符压缩阈值的更小预算；本章测试验证窗口可继续、完整 shell 输出可找回。运行时安全兜底来自 s07/s11，不宣称与 Pi 的失败策略相同。
 - s13 按规划增加 Python Extension 的工具、Hooks 和事件注册，验证“技能说明”与“执行代码”可以分别接入当前 Harness；这些接口不提前写进 s12。

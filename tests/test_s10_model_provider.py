@@ -27,6 +27,13 @@ def test_default_session_root_is_scoped_to_s10() -> None:
     assert chapter.SESSION_ROOT == Path(".sessions/s10")
 
 
+def test_summary_options_follow_api_type_not_model_name() -> None:
+    anthropic = chapter.AnthropicProvider(client=None, model="deepseek-flash")
+    compatible = chapter.OpenAIChatProvider(client=None, model="deepseek-flash")
+    assert chapter.summary_request_options(anthropic) == {"thinking": {"type": "disabled"}}
+    assert chapter.summary_request_options(compatible) == {}
+
+
 def test_anthropic_provider_normalizes_response_and_streams_text() -> None:
     response = SimpleNamespace(
         content=[SimpleNamespace(type="text", text="你好")],

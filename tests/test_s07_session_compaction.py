@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 import s07_session_compaction.code as chapter
 
 
@@ -204,7 +206,7 @@ def test_next_compaction_updates_previous_summary_without_resummarizing_it(tmp_p
     assert all("[会话摘要]" not in str(message["content"]) for message in calls[0][0])
 
 
-def test_compactor_uses_safe_fallback_when_summary_is_unavailable(tmp_path) -> None:
+def test_compactor_keeps_original_context_when_summary_is_unavailable(tmp_path) -> None:
     session = chapter.SessionManager.open(tmp_path / "session.jsonl")
     session.append_message(_message("user", "较早任务" * 80))
     session.append_message(_message("user", "最新任务"))
@@ -214,14 +216,12 @@ def test_compactor_uses_safe_fallback_when_summary_is_unavailable(tmp_path) -> N
         lambda messages, previous_summary: None,
     )
 
-    outcome = compactor.compact_if_needed()
-    context = session.build_context()
-
-    assert outcome is not None
-    assert outcome.summary_kind == "fallback"
-    assert str(session.path) in str(context[0]["content"])
-    assert "较早任务" in str(context[0]["content"])
-    assert context[1] == _message("user", "最新任务")
+    original = session.build_context()
+    original_file = session.path.read_text(encoding="utf-8")
+    with pytest.raises(RuntimeError, match="摘要模型未返回正文"):
+        compactor.compact_if_needed()
+    assert session.build_context() == original
+    assert session.path.read_text(encoding="utf-8") == original_file
 
 
 def test_context_summarizer_uses_a_separate_tool_free_request() -> None:
@@ -231,14 +231,18 @@ def test_context_summarizer_uses_a_separate_tool_free_request() -> None:
         requests.append(kwargs)
         return SimpleNamespace(content=[SimpleNamespace(type="text", text="摘要结果")])
 
-    assert chapter.summarize_context(
-        [_message("user", "原始任务")],
-        create_message,
-        previous_summary="已有摘要",
-        max_tokens=300,
-    ) == "摘要结果"
+    assert (
+        chapter.summarize_context(
+            [_message("user", "原始任务")],
+            create_message,
+            previous_summary="已有摘要",
+            max_tokens=300,
+        )
+        == "摘要结果"
+    )
     assert requests[0]["system"] == chapter.COMPACTION_SYSTEM
     assert requests[0]["tools"] == []
+    assert requests[0]["thinking"] == {"type": "disabled"}
     assert requests[0]["max_tokens"] == 300
     assert "原始任务" in str(requests[0]["messages"])
     assert "已有摘要" in str(requests[0]["messages"])
@@ -269,9 +273,29 @@ def test_context_summarizer_retries_with_more_tokens_for_thinking_only_response(
         requests.append(kwargs)
         return responses.pop(0)
 
-    assert chapter.summarize_context(
-        [_message("user", "原始任务")],
-        create_message,
-        max_tokens=300,
-    ) == "重试后的摘要"
+    assert (
+        chapter.summarize_context(
+            [_message("user", "原始任务")],
+            create_message,
+            max_tokens=300,
+        )
+        == "重试后的摘要"
+    )
     assert [request["max_tokens"] for request in requests] == [300, 1024]
+    assert all(request["thinking"] == {"type": "disabled"} for request in requests)
+
+
+def test_summary_request_options_can_be_overridden_for_another_api() -> None:
+    requests = []
+
+    def request(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text="摘要")])
+
+    summarizer = chapter.ContextSummarizer(
+        create_message=request,
+        max_tokens=4096,
+        request_options={},
+    )
+    assert summarizer([_message("user", "任务")], None) == "摘要"
+    assert "thinking" not in requests[0]

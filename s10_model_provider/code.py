@@ -89,11 +89,7 @@ class TerminalEventSink:
         elif event.type == "tool_result":
             print(format_tool_result(event.data["output"]), flush=True)
         elif event.type == "compaction":
-            source = (
-                "模型摘要"
-                if event.data["summary_kind"] == "model"
-                else "确定性回退摘要"
-            )
+            source = "模型摘要" if event.data["summary_kind"] == "model" else "确定性回退摘要"
             print(
                 "会话  已压缩 "
                 f"{event.data['before_chars']} → {event.data['after_chars']} 字符，"
@@ -511,6 +507,20 @@ def _openai_usage(usage: Any) -> ModelUsage:
 # ===== s10 新增：按环境配置创建 Provider =====
 
 
+# s10 修复：接口专有字段由 Provider 层选择，s07 摘要策略不假设所有 API 都兼容。
+def summary_request_options(provider: ModelProvider) -> dict[str, Any]:
+    """为当前接口选择摘要请求选项，不修改正常回答配置。
+
+    输入：已创建的 ModelProvider。
+    输出：Anthropic 使用显式关闭思考；其他 Provider 返回空选项，不猜测其专有参数。
+    流程：识别接口实现 → 选择摘要参数 → 由 main 传给 ContextSummarizer。
+    边界：兼容服务可能不支持或忽略参数；不能仅凭模型名字判断接口能力。
+    """
+    if isinstance(provider, AnthropicProvider):
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
 def create_model_provider(
     *,
     timeout_seconds: float,
@@ -561,8 +571,7 @@ def create_model_provider(
         return OpenAIChatProvider(OpenAI(**client_options), model)
 
     raise RuntimeError(
-        "MODEL_PROVIDER 仅支持 anthropic 或 openai-compatible，"
-        f"当前值：{provider_name}"
+        f"MODEL_PROVIDER 仅支持 anthropic 或 openai-compatible，当前值：{provider_name}"
     )
 
 
@@ -725,9 +734,7 @@ def agent_loop(
         emit(AgentEvent(type="assistant_message", data={"message": assistant_message}))
 
         tool_calls = [
-            block
-            for block in assistant_message["content"]
-            if _get(block, "type") == "tool_use"
+            block for block in assistant_message["content"] if _get(block, "type") == "tool_use"
         ]
         if not tool_calls:
             emit(AgentEvent(type="agent_end", data={"messages": list(messages)}))
@@ -797,9 +804,13 @@ def main(arguments: Sequence[str] | None = None) -> None:
         keep_recent_chars=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_CHARS", 12000),
     )
     summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
+    # s10 修复：摘要选项单独组装，OpenAI-compatible 不接收 Anthropic 的 thinking 字段。
+    summary_options = summary_request_options(provider)
     summarizer = ContextSummarizer(
         create_message=summary_requester,
         max_tokens=summary_max_tokens,
+        # s10 修复：仅摘要使用这组选项，主 Agent 的 assistant_requester 保持不变。
+        request_options=summary_options,
     )
     compactor = ContextCompactor(session=session, policy=policy, summarize=summarizer)
     request_with_context = CompactedContextRequester(

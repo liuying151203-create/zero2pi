@@ -45,6 +45,8 @@ COMPACTION_SYSTEM = """你负责压缩 Agent 会话记录。
 
 # s07 修复：摘要请求只保留工具结果片段，避免巨型文件内容再次塞满摘要上下文。
 SUMMARY_TOOL_RESULT_MAX_CHARS = 2000
+# s07 修复：摘要只需要最终正文，Anthropic 摘要请求显式关闭思考；不影响正常任务请求。
+SUMMARY_REQUEST_OPTIONS = {"thinking": {"type": "disabled"}}
 
 # ===== 来自 s06：Agent 运行时依赖（保持） =====
 # s07 只替换会话 Entry 和上下文投影，工具与 Hooks 继续复用 s06。
@@ -53,8 +55,7 @@ DispatchTool = previous.DispatchTool
 Hooks = previous.Hooks
 # s07 修改：系统提示词只保留工具选择原则，参数细节交给工具定义说明。
 SYSTEM = (
-    previous.SYSTEM
-    + "分析任务优先使用只读工具；大文件用 read_file 分段读取，"
+    previous.SYSTEM + "分析任务优先使用只读工具；大文件用 read_file 分段读取，"
     "不要创建临时脚本或改用 shell 截取。"
     "工具被拒绝后不要换等价命令重试；信息足够后立即停止。"
 )
@@ -308,16 +309,20 @@ def _block_type(block: object) -> object:
 def _has_tool_use(message: Message) -> bool:
     """判断 assistant 消息是否包含 tool_use 块。"""
     content = message.get("content")
-    return message.get("role") == "assistant" and isinstance(content, list) and any(
-        _block_type(block) == "tool_use" for block in content
+    return (
+        message.get("role") == "assistant"
+        and isinstance(content, list)
+        and any(_block_type(block) == "tool_use" for block in content)
     )
 
 
 def _is_tool_result(message: Message) -> bool:
     """判断 user 消息是否包含 tool_result 块。"""
     content = message.get("content")
-    return message.get("role") == "user" and isinstance(content, list) and any(
-        _block_type(block) == "tool_result" for block in content
+    return (
+        message.get("role") == "user"
+        and isinstance(content, list)
+        and any(_block_type(block) == "tool_result" for block in content)
     )
 
 
@@ -486,34 +491,11 @@ type SummarizeContext = Callable[[Sequence[Message], str | None], str | None]
 class CompactionOutcome:
     """描述一次压缩的来源和压缩前后大小，供终端直接展示。"""
 
-    summary_kind: Literal["model", "fallback"]
+    summary_kind: Literal["model"]
     before_chars: int
     after_chars: int
     summarized_messages: int
     retained_messages: int
-
-
-# s07 修改：回退摘要保留已有摘要和用户原文，不再只留下会话文件指针。
-def _fallback_summary(
-    session_path: Path,
-    messages_to_summarize: Sequence[Message],
-    previous_summary: str | None,
-) -> str:
-    """从确定信息构造回退摘要，避免摘要模型失败时丢失任务目标。"""
-    sections = ["自动摘要没有返回最终文本，以下内容由程序从会话中提取。"]
-    if previous_summary:
-        sections.append(f"已有摘要：\n{previous_summary}")
-
-    user_texts: list[str] = []
-    for message in messages_to_summarize:
-        if message.get("role") != "user" or not isinstance(message.get("content"), str):
-            continue
-        user_texts.append(_truncate_for_summary(str(message["content"]), 1000, "用户消息"))
-    if user_texts:
-        recent_requests = "\n".join(f"- {text}" for text in user_texts[-3:])
-        sections.append(f"较早消息中的用户要求：\n{recent_requests}")
-    sections.append(f"完整记录：{session_path}")
-    return "\n\n".join(sections)
 
 
 def _summary_context(summary: str, retained_tail: Sequence[Message]) -> list[Message]:
@@ -556,7 +538,7 @@ class ContextCompactor:
     作用：会话需要压缩时，根据准备计划生成摘要并把结果写回会话日志。
     输入：SessionManager、CompactionPolicy 和可注入的摘要函数。
     输出：发生压缩时返回包含压缩来源和前后大小的结果；未超过阈值时返回 None。
-    流程：准备压缩计划 → 更新摘要或生成回退文本 → 复核大小 → 保存压缩记录。
+    流程：准备压缩计划 → 生成摘要 → 空摘要停止，成功则复核大小并保存压缩记录。
     """
 
     def __init__(
@@ -574,7 +556,7 @@ class ContextCompactor:
 
         输入：实例持有的会话、阈值策略和摘要函数。
         输出：未压缩返回 None；压缩后返回 `CompactionOutcome` 供请求层展示统计信息。
-        流程：准备计划 → 总结计划中的消息 → 必要时回退 → 限制最终大小并落盘。
+        流程：准备计划 → 总结消息 → 拒绝空摘要 → 限制最终大小并落盘。
         """
         # s07 修改：准备阶段集中解释消息边界，上层方法只展示压缩执行顺序。
         plan = prepare_compaction(self.session.load_entries(), self.policy)
@@ -584,14 +566,9 @@ class ContextCompactor:
         # 参考 Pi：旧摘要和待总结消息分开传入，执行的是增量更新而非摘要套摘要。
         summary = self.summarize(plan.messages_to_summarize, plan.previous_summary)
         if summary is None:
-            summary = _fallback_summary(
-                self.session.path,
-                plan.messages_to_summarize,
-                plan.previous_summary,
-            )
-            summary_kind: Literal["model", "fallback"] = "fallback"
-        else:
-            summary_kind = "model"
+            # s07 修复：空摘要不能覆盖已有代码证据；保留日志并停止，不写回退压缩记录。
+            raise RuntimeError("摘要模型未返回正文，已停止本次任务，原始会话仍保留。")
+        summary_kind = "model"
         summary = _fit_summary_to_budget(
             summary,
             plan.retained_tail,
@@ -618,12 +595,14 @@ def summarize_context(
     *,
     previous_summary: str | None = None,
     max_tokens: int,
+    # s07 修复：允许 Provider 层覆盖接口参数，避免后续 Chat Completions 收到错误字段。
+    request_options: dict[str, Any] | None = None,
 ) -> str | None:
     """把消息序列交给模型并返回摘要文本。
 
     作用：把待压缩消息序列化为普通用户文本，避免在摘要请求中重放工具调用协议。
-    输入：尚未进入旧摘要的待总结消息、底层模型请求函数、可选旧摘要和输出 token 上限。
-    输出：摘要文本；两次请求都没有最终文本时返回 None。
+    输入：待总结消息、底层请求函数、旧摘要、输出上限与摘要专用接口选项。
+    输出：摘要文本；请求均没有最终文本时返回 None。
     流程：裁剪工具结果并序列化 → 携带旧摘要请求更新 → 必要时扩大输出额度重试一次。
     """
 
@@ -640,6 +619,8 @@ def summarize_context(
         "请生成更新后的完整摘要。"
     )
     token_limits = [max_tokens]
+    # s07 修复：s07-s09 直接使用 Anthropic；s10 开始由 Provider 层显式提供选项。
+    options = SUMMARY_REQUEST_OPTIONS if request_options is None else request_options
     if max_tokens < 1024:
         # s07 修复：低额度可能只够模型输出 thinking，因此用至少 1024 token 自动重试一次。
         token_limits.append(1024)
@@ -649,6 +630,8 @@ def summarize_context(
             messages=[{"role": "user", "content": prompt}],
             tools=[],
             max_tokens=token_limit,
+            # s07 修复：选项仅进入摘要调用，不能混进 agent_loop 的正常任务请求。
+            **options,
         )
         summary = previous._text_from_content(response.content).strip()
         if summary:
@@ -659,22 +642,35 @@ def summarize_context(
 # s07 新增：把摘要函数和它需要的模型请求器组成一个可读的依赖组件。
 @dataclass(frozen=True)
 class ContextSummarizer:
-    """保存摘要模型调用依赖，并把它暴露为可调用对象。"""
+    """组装摘要依赖，为压缩器提供独立的摘要入口。
+
+    输入：底层请求器、输出额度、摘要专用参数；调用时接收待总结消息与旧摘要。
+    输出：完整摘要文本；没有正文时返回 None，由压缩器决定停止任务。
+    流程：保存请求依赖 → 调用 summarize_context → 返回摘要，不改写会话记录。
+    """
 
     create_message: Callable[..., Any]
     max_tokens: int
+    # s07 修复：保存摘要专用参数，组装时可明确看出正常回答与摘要请求的区别。
+    request_options: dict[str, Any] | None = None
 
     def __call__(
         self,
         messages_to_summarize: Sequence[Message],
         previous_summary: str | None,
     ) -> str | None:
-        """使用旧摘要和尚未摘要的消息生成完整的新摘要。"""
+        """将待总结消息与旧摘要交给独立请求器，返回新摘要或 None。
+
+        流程：传入消息和旧摘要 → 附带输出额度及接口选项 → 返回提取后的正文。
+        本方法只传递依赖；请求重试与正文提取由 summarize_context 负责。
+        """
         return summarize_context(
             messages_to_summarize,
             self.create_message,
             previous_summary=previous_summary,
             max_tokens=self.max_tokens,
+            # s07 修复：把接口选项交给实际摘要请求，不让上层循环感知 API 字段。
+            request_options=self.request_options,
         )
 
 
@@ -718,6 +714,7 @@ class CompactedContextRequester:
 
 # ===== 来自 s06：核心循环（展开保持） =====
 # s07 在当前文件完整保留循环；相对 s06，模型请求组件会先压缩再投影最新上下文。
+
 
 def _get(block: Any, name: str) -> Any:
     """兼容读取 SDK 对象和测试替身中的字段。"""
@@ -763,9 +760,7 @@ def agent_loop(
             save_message(assistant_message)
 
         tool_calls = [
-            block
-            for block in assistant_message["content"]
-            if _get(block, "type") == "tool_use"
+            block for block in assistant_message["content"] if _get(block, "type") == "tool_use"
         ]
         if not tool_calls:
             return messages

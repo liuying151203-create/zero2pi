@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -435,9 +436,8 @@ def test_error_summary_text_is_not_saved_as_compaction(tmp_path) -> None:
         emit=lambda event: None,
     )
 
-    result = summarizer([_message("user", "旧问题")], None)
-
-    assert result.text is None
+    with pytest.raises(RuntimeError, match="摘要模型未返回正文"):
+        summarizer([_message("user", "旧问题")], None)
     assert isinstance(session.load_entries()[0], chapter.ModelErrorEntry)
     assert session.session_stats().known_tokens == 14
 
@@ -471,3 +471,244 @@ def test_session_stats_recounts_tool_calls_from_saved_assistant_messages(tmp_pat
     )
 
     assert chapter.SessionManager.open(session.path).session_stats().tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    "content, expected_types, text_chars, thinking_chars, other_count",
+    [
+        (
+            [{"type": "thinking", "thinking": "秘密思考", "signature": "秘密签名"}],
+            ["thinking"],
+            0,
+            4,
+            0,
+        ),
+        ([{"type": "output_text", "text": "未识别的正文"}], ["output_text"], 0, 0, 1),
+        ([{"type": "text", "text": " \n\t"}], ["text"], 3, 0, 0),
+        ([], [], 0, 0, 0),
+    ],
+)
+def test_empty_summary_diagnostic_records_structure_without_payload(
+    tmp_path,
+    content,
+    expected_types,
+    text_chars,
+    thinking_chars,
+    other_count,
+):
+    events = []
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    usage = chapter.previous.ModelUsage(input_tokens=3527, output_tokens=4096)
+    response = chapter.ModelResponse(
+        content=content,
+        model="offline-test",
+        stop_reason="max_tokens",
+        usage=usage,
+    )
+    summarizer = chapter.ContextSummarizer(
+        create_message=lambda **kwargs: response,
+        max_tokens=4096,
+        session=session,
+        emit=events.append,
+    )
+    with pytest.raises(RuntimeError, match="摘要模型未返回正文"):
+        summarizer([{"role": "user", "content": "审查代码"}], None)
+    assert len(events) == 1
+    assert events[0].type == "summary_empty"
+    details = events[0].data["response_details"]
+    assert details["response_stage"] == "normalized"
+    assert details["content_types"] == expected_types
+    assert details["text_chars"] == text_chars
+    assert details["thinking_chars"] == thinking_chars
+    assert details["extracted_text_chars"] == 0
+    assert len(details["other_blocks"]) == other_count
+    assert details["max_tokens"] == 4096
+    assert details["stop_reason"] == "max_tokens"
+    assert details["usage"] == usage.to_dict()
+    if other_count:
+        assert details["other_blocks"][0]["fields"] == ["text", "type"]
+        assert details["other_blocks"][0]["string_chars"] > 0
+    serialized = json.dumps(details, ensure_ascii=False)
+    assert "秘密思考" not in serialized
+    assert "秘密签名" not in serialized
+    assert "未识别的正文" not in serialized
+
+
+def test_summary_diagnostic_uses_existing_trace_and_does_not_double_count(tmp_path, capsys):
+    calls = []
+
+    class Provider:
+        model = "offline-test"
+
+        def complete(self, **kwargs):
+            calls.append(kwargs)
+            return chapter.ModelResponse(
+                content=[{"type": "thinking", "thinking": "不会保存的思考内容"}],
+                model=self.model,
+                stop_reason="max_tokens",
+                usage=chapter.previous.ModelUsage(input_tokens=3527, output_tokens=4096),
+            )
+
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    trace_path = tmp_path / "trace.jsonl"
+    events = chapter.EventDispatcher()
+    tracker = chapter.UsageTracker()
+    events.subscribe(chapter.JsonlTraceRecorder(trace_path))
+    events.subscribe(tracker)
+    events.subscribe(chapter.show_summary_diagnostic)
+    requester = chapter.BlockingModelRequester(Provider(), 60, events.emit)
+    summarizer = chapter.ContextSummarizer(
+        create_message=requester,
+        max_tokens=4096,
+        session=session,
+        emit=events.emit,
+    )
+    with pytest.raises(RuntimeError, match="摘要模型未返回正文"):
+        summarizer([{"role": "user", "content": "审查代码"}], None)
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["type"] for record in records] == [
+        "model_request",
+        "model_response",
+        "summary_empty",
+    ]
+    assert records[-1]["data"]["response_details"]["thinking_chars"] == len("不会保存的思考内容")
+    assert "不会保存的思考内容" not in trace_path.read_text(encoding="utf-8")
+    assert len(calls) == 1
+    assert calls[0]["max_tokens"] == 4096
+    assert tracker.stats.model_requests == tracker.stats.summary_requests == 1
+    assert tracker.stats.failed_requests == 1
+    assert tracker.stats.total_tokens == 7623
+    assert session.session_stats().known_tokens == 7623
+    output = capsys.readouterr().out
+    assert "4096 tokens" in output
+    assert "thinking" in output
+    assert "不会保存的思考内容" not in output
+
+
+def test_successful_summary_does_not_emit_empty_diagnostic(tmp_path):
+    events = []
+    response = chapter.ModelResponse(
+        content=[{"type": "text", "text": "可用摘要"}],
+        model="offline-test",
+        stop_reason="end_turn",
+        usage=None,
+    )
+    summarizer = chapter.ContextSummarizer(
+        create_message=lambda **kwargs: response,
+        max_tokens=4096,
+        session=chapter.SessionManager.open(tmp_path / "session.jsonl"),
+        emit=events.append,
+    )
+    assert summarizer([{"role": "user", "content": "审查代码"}], None).text == "可用摘要"
+    assert events == []
+
+
+def test_summary_retry_reports_actual_budget_for_each_empty_response(tmp_path):
+    events = []
+    budgets = []
+
+    def request(**kwargs):
+        budgets.append(kwargs["max_tokens"])
+        return chapter.ModelResponse(
+            content=[],
+            model="offline-test",
+            stop_reason="max_tokens",
+            usage=None,
+        )
+
+    summarizer = chapter.ContextSummarizer(
+        create_message=request,
+        max_tokens=256,
+        session=chapter.SessionManager.open(tmp_path / "session.jsonl"),
+        emit=events.append,
+    )
+    with pytest.raises(RuntimeError, match="摘要模型未返回正文"):
+        summarizer([{"role": "user", "content": "审查代码"}], None)
+    assert budgets == [256, 1024]
+    assert [event.data["response_details"]["max_tokens"] for event in events] == budgets
+    assert all(event.data["response_details"]["usage"] is None for event in events)
+
+
+def test_summary_disables_thinking_at_provider_boundary_without_changing_normal_request(tmp_path):
+    requests = []
+
+    def sdk_create(**kwargs):
+        requests.append(kwargs)
+        disabled = kwargs.get("thinking") == {"type": "disabled"}
+        return SimpleNamespace(
+            content=[{"type": "text", "text": "已完成代码定位，接下来审查边界"}]
+            if disabled
+            else [{"type": "thinking", "thinking": "仍在思考"}],
+            model="deepseek-flash",
+            stop_reason="end_turn" if disabled else "max_tokens",
+            usage=SimpleNamespace(input_tokens=100, output_tokens=20),
+        )
+
+    client = SimpleNamespace(messages=SimpleNamespace(create=sdk_create))
+    provider = chapter.previous.AnthropicProvider(client, "deepseek-flash")
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    session.append_message(_message("user", "旧任务" * 500))
+    session.append_message(_message("user", "现在审查代码"))
+    events = chapter.EventDispatcher()
+    tracker = chapter.UsageTracker()
+    events.subscribe(tracker)
+    requester = chapter.BlockingModelRequester(provider, 60, events.emit)
+    options = chapter.summary_request_options(provider)
+    summarizer = chapter.ContextSummarizer(
+        create_message=requester,
+        max_tokens=4096,
+        session=session,
+        emit=events.emit,
+        request_options=options,
+    )
+    compactor = chapter.ContextCompactor(
+        session=session,
+        policy=chapter.CompactionPolicy(max_context_chars=1000, keep_recent_chars=400),
+        summarize=summarizer,
+    )
+    outcome = compactor.compact_if_needed()
+    assert outcome is not None and outcome.summary_kind == "model"
+    assert requests[0]["thinking"] == {"type": "disabled"}
+    assert requests[0]["max_tokens"] == 4096
+    assert requests[0]["tools"] == []
+    assert "已完成代码定位" in session.build_context()[0]["content"]
+    assert tracker.stats.model_requests == 1
+    assert tracker.stats.failed_requests == 0
+    assert tracker.stats.total_tokens == session.session_stats().known_tokens == 120
+
+    provider.complete(system="正常任务", messages=[_message("user", "审查代码")], max_tokens=8000)
+    assert "thinking" not in requests[-1]
+
+
+@pytest.mark.parametrize("fail_request", [False, True])
+def test_runtime_guard_ends_task_and_preserves_completed_messages(fail_request):
+    messages = [_message("user", "只读审查")]
+    events = []
+    executed = []
+
+    def request(**kwargs):
+        if fail_request:
+            raise RuntimeError("摘要模型未返回正文")
+        return chapter.ModelResponse(
+            content=[{"type": "tool_use", "id": "t1", "name": "glob", "input": {}}],
+            model="offline-test",
+            stop_reason="tool_use",
+            usage=chapter.ModelUsage(),
+        )
+
+    with pytest.raises(RuntimeError):
+        chapter.agent_loop(
+            messages,
+            create_message=request,
+            dispatch=lambda name, arguments: executed.append(name) or "code.py",
+            system="test",
+            hooks=chapter.Hooks(),
+            emit=events.append,
+            max_rounds=1,
+        )
+    assert events[-1].type == "agent_end"
+    assert events[-1].data["reason"] == ("request_failed" if fail_request else "max_rounds")
+    assert executed == ([] if fail_request else ["glob"])
+    assert len(messages) == (1 if fail_request else 3)
+    if not fail_request:
+        assert messages[-1]["content"][0]["type"] == "tool_result"
