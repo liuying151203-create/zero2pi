@@ -23,7 +23,9 @@ s12 在 s11 基础上加入技能目录。启动时只把名称、描述和 `SKI
 | `build_system_prompt()` | 基础 `SYSTEM`、目录 | 生成含目录的 `system_prompt` |
 | `read_file()` | 路径、起始行、行数 | 返回有界代码窗口及继续位置 |
 | `dispatch_tool()` | 已通过 Hooks 的工具调用 | 读取用本章窗口；其他工具复用 s11，超长结果存档 |
-| `ContextSummarizer` | s11 摘要依赖、待总结消息 | 正常流程继承 s11；空摘要停止任务，不落盘回退压缩 |
+| `ContextSummarizer` | s11 摘要依赖、待总结消息 | 沿用 s11 请求规则；空摘要记录结构诊断并停止，不落盘回退压缩 |
+| `_summary_response_details()` | 转换后的模型响应 | 只统计内容块类型和长度，不保存原文 |
+| `show_summary_diagnostic()` | `summary_empty` 事件 | 显示诊断；作为观察者注册，不参与模型请求或统计 |
 
 `main()` 是组装入口：先获得 `skill_catalog`，再生成 `system_prompt`，最后通过 `agent_loop(system=system_prompt)` 传给回答请求器。摘要请求仍使用 s07 的专用摘要提示词。
 
@@ -60,9 +62,12 @@ flowchart LR
     J -->|summarize| K[ContextCompactor: compactor]
     K -->|compactor| L[request_with_context]
     L -->|create_message| E
+    J -->|summary_empty: response_details| M[events]
+    M -->|subscribe: show_summary_diagnostic| N[终端诊断观察者]
+    M -->|subscribe: trace_recorder| O[JSONL Trace]
 ```
 
-`SkillCatalog` 没有装进压缩器或请求器；它只用于组装系统提示词。本章显式展开完整 `agent_loop`，增加轮数上限；Hooks、会话和统计继续复用 s11。`summarizer` 继承 s11，只改变空摘要的处理，不额外增加一层请求包装。
+`SkillCatalog` 没有装进压缩器或请求器；它只用于组装系统提示词。本章显式展开完整 `agent_loop`，增加轮数上限；Hooks、会话和统计继续复用 s11。`summarizer` 继承 s11 的构造参数，显式展开摘要流程以取得失败响应结构，不额外增加请求包装层。诊断扩充现有 `summary_empty` 事件，观察者和 Trace 接收同一份数据，不重复计费。
 
 ## 技能文件
 
@@ -125,6 +130,34 @@ python -m pytest tests/test_s12_skill_loading.py
 这不是 shell 沙箱，也不能保证模型永远不选 bash：shell 仍会先生成完整输出；每轮还可能包含多个工具调用。工具边界限制进入上下文的内容，轮数边界防止无限运行。这里只改变 s12，s07/s11 的回退策略不变。
 
 复测建议直接新建对话，不加载已经反复压缩的旧会话。离线测试验证预算、继续位置、输出存档、空摘要停止和轮数上限；没有代替真实模型的任务完成率验证。
+
+## 空摘要怎么定位
+
+输出额度从 1024 提高到 4096 后，实际运行仍出现 `max_tokens` 且正文为空，见 [B009](../docs/bug-log.md#b009摘要额度提高后仍无正文缺少响应结构证据)。不能只靠增加额度判断根因；s12 在提取不到摘要时，记录 Provider 转换后的内容结构。
+
+再次启动并输入原来的审查任务；若摘要仍失败，错误前会出现类似下面的**示意输出**：
+
+```text
+摘要诊断  停止=max_tokens；额度=4096 tokens；内容块=thinking；正文=0 字符；思考=15000 字符；提取正文=0 字符。
+```
+
+这里的字符数不是 Token 数；终端显示停止原因、实际请求额度和内容长度，Trace 的 `summary_empty.data.response_details` 还包含实际用量，以及未知内容块的字段名和字符串长度。只记录元数据，不记录正文、思考原文或签名。
+
+| 观察到的证据 | 可以判断什么 |
+|---|---|
+| 只有 `thinking`，`thinking_chars>0`，`text_chars=0`，停止原因为 `max_tokens` | 转换后的响应只有思考，最终正文未出现；支持“思考耗尽额度”的判断 |
+| `other_blocks` 中有未知类型及字符串内容 | 检查内容结构与解析规则，不直接把未知块或思考当摘要 |
+| `text_chars>0`，`extracted_text_chars=0`，正文只有空白 | 响应包含 text 块，但去空白后不是可用摘要 |
+| `content_types=[]` | 转换后的响应为空；还需检查 SDK 原始返回及 Provider 转换，不能断言服务没有返回内容 |
+
+查看最新 Trace 的诊断：
+
+```powershell
+$summaryTrace = Get-ChildItem .traces\s12\*.jsonl | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+Get-Content -LiteralPath $summaryTrace.FullName -Encoding utf8 | ForEach-Object { ConvertFrom-Json $_ } | Where-Object { $_.type -eq 'summary_empty' } | Select-Object -ExpandProperty data | ConvertTo-Json -Depth 8
+```
+
+成功摘要不产生空摘要诊断；请求超时或异常仍走原有 `model_error`。此阶段不调整预算、不关闭思考、不切换模型，也不追溯补写旧响应；先获得新证据，再针对实际返回处理。
 
 ## 参考与差异
 
