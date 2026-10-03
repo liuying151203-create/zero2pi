@@ -16,16 +16,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 import yaml
 from dotenv import load_dotenv
 
+# 来自 s03：保持；复用文件工具的工作区边界，不改变权限判断。
+from s03_permission import code as s03
 from s05_session_persistence import code as s05
 from s11_runtime_observability import code as previous
 from zero2pi.ui import format_error, format_user_prompt
 
 # ===== 来自 s11：运行时与工具依赖（保持） =====
-# 会话、压缩、模型请求、权限和观察者复用 s11，新增机制只在技能目录与提示词组装处。
+# 会话、模型请求、权限和观察者复用 s11；工具返回与空摘要保护在本章就地展开。
 
 Message = previous.Message
 ModelResponse = previous.ModelResponse
@@ -37,7 +40,6 @@ EventSink = previous.EventSink
 AgentEvent = previous.AgentEvent
 SessionManager = previous.SessionManager
 CompactionPolicy = previous.CompactionPolicy
-ContextSummarizer = previous.ContextSummarizer
 ContextCompactor = previous.ContextCompactor
 CompactedContextRequester = previous.CompactedContextRequester
 BlockingModelRequester = previous.BlockingModelRequester
@@ -48,8 +50,6 @@ JsonlTraceRecorder = previous.JsonlTraceRecorder
 UsageTracker = previous.UsageTracker
 SessionErrorRecorder = previous.SessionErrorRecorder
 SYSTEM = previous.SYSTEM
-TOOLS = previous.TOOLS
-dispatch_tool = previous.dispatch_tool
 execute_tool = previous.execute_tool
 make_permission_hook = previous.make_permission_hook
 create_model_provider = previous.create_model_provider
@@ -62,6 +62,125 @@ SESSION_ROOT = Path(".sessions/s12")
 TRACE_ROOT = Path(".traces/s12")
 # s12 新增：只发现本章项目内的技能，目录相对启动工作区解析。
 SKILLS_ROOT = Path("s12_skill_loading/skills")
+# s12 修复：采用小窗口减少工具结果占用；思考内容仍可能超预算，由空摘要保护停止。
+READ_MAX_LINES = 80
+TOOL_OUTPUT_MAX_CHARS = 4000
+MAX_MODEL_ROUNDS = 12
+
+# s12 修改：只更新本章工具说明，不修改 s11 的共享定义；执行层仍强制限制输出。
+TOOLS = [dict(tool) for tool in previous.TOOLS]
+for tool in TOOLS:
+    if tool["name"] == "read_file":
+        tool["description"] = (
+            f"读取工作区 UTF-8 文件，每次最多 {READ_MAX_LINES} 行、"
+            f"{TOOL_OUTPUT_MAX_CHARS} 字符正文。"
+            "使用 start_line 和 limit 读取目标范围；需要全文时按返回的 start_line 继续读取。"
+        )
+    elif tool["name"] == "bash":
+        tool["description"] += (
+            f" 返回最多 {TOOL_OUTPUT_MAX_CHARS} 字符正文，超出内容另存文件。"
+            "搜索限定到任务相关目录，避免递归扫描 .venv；无结果时不要反复重试等价命令。"
+        )
+
+
+# ===== s12 修复：有界工具返回与空摘要保护 =====
+
+
+def read_file(path: str, start_line: int = 1, limit: int | None = None) -> str:
+    """按完整行读取目标窗口，避免整个代码文件立即触发压缩。
+
+    输入：工作区内的文件路径、一基起始行和可选行数。
+    输出：不超过行数及字符预算的正文；未读完时附上下一次 start_line。
+    流程：复用 s03 路径校验 → 读取文本 → 按两种预算收集完整行 → 提示继续位置。
+    边界：技能全文也可分段读取；单行本身超预算时报告错误，不伪装成完整内容。
+    """
+    try:
+        if start_line < 1 or (limit is not None and limit < 1):
+            raise ValueError("start_line 和 limit 必须为正整数")
+        lines = s03.safe_path(path).read_text(encoding="utf-8").splitlines()
+        if start_line > len(lines):
+            return f"(start_line {start_line} exceeds file length {len(lines)})"
+
+        # s12 修复：即使模型不传 limit 或传入大值，也不能取消工具输出预算。
+        line_limit = min(limit if limit is not None else READ_MAX_LINES, READ_MAX_LINES)
+        selected: list[str] = []
+        chars = 0
+        for line in lines[start_line - 1 : start_line - 1 + line_limit]:
+            line_chars = len(line) + (1 if selected else 0)
+            if chars + line_chars > TOOL_OUTPUT_MAX_CHARS:
+                break
+            selected.append(line)
+            chars += line_chars
+        if not selected:
+            return f"Error: 第 {start_line} 行超过字符预算，无法按完整行读取；请说明此限制。"
+
+        output = "\n".join(selected)
+        next_line = start_line + len(selected)
+        if next_line <= len(lines):
+            # s12 修复：下一行根据实际返回行数计算，字符截断也不会跳过未读代码。
+            output += (
+                f"\n\n[已显示第 {start_line}-{next_line - 1} 行，共 {len(lines)} 行；"
+                f"需要更多内容时用 read_file(start_line={next_line}, limit={READ_MAX_LINES})。]"
+            )
+        return output
+    except (OSError, UnicodeError, ValueError) as error:
+        return f"Error: {error}"
+
+
+def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
+    """分发已通过 Hooks 的工具调用，并限制返回给模型的文本。
+
+    输入：工具名称和参数；权限仍由 execute_tool 在分发前检查。
+    输出：有界结果或错误文本；非文件读取的超长结果附带完整结果路径。
+    流程：read_file 使用本章窗口 → 其他工具复用 s11 → 超长结果存档并返回预览。
+    边界：限制模型输入，不是 shell 沙箱；完整 shell 输出仍会先在内存中生成。
+    """
+    if name == "read_file":
+        try:
+            return read_file(**arguments)
+        except TypeError as error:
+            return f"Error: invalid arguments for read_file: {error}"
+    output = previous.dispatch_tool(name, arguments)
+    if len(output) <= TOOL_OUTPUT_MAX_CHARS:
+        return output
+
+    # s12 修复：参考 Pi 的 shell 输出存档；只把有界预览送入 JSONL 与模型上下文。
+    output_path = SESSION_ROOT / "tool-results" / f"{uuid4().hex}.txt"
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(output, encoding="utf-8")
+    except OSError as error:
+        return f"Error: 无法保存完整工具结果：{error}"
+    return (
+        output[:TOOL_OUTPUT_MAX_CHARS]
+        + f"\n\n[输出已截断，原文 {len(output)} 字符；完整结果：{output_path.as_posix()}。"
+        "请缩小搜索范围，不要整份重读存档。]"
+    )
+
+
+# s12 修复：只改变本章空摘要策略；s11 的请求、失败用量记录和成功返回保持。
+class ContextSummarizer(previous.ContextSummarizer):
+    """生成摘要；失败时停止任务，而不是丢掉技能与代码证据后继续操作。
+
+    输入：待压缩消息与旧摘要；构造依赖和正常请求流程均继承 s11。
+    输出：成功时返回 s11 SummaryResult；无文本时抛出 RuntimeError 给交互入口。
+    流程：调用 s11 摘要请求与失败记录 → 检查正文 → 允许压缩或明确停止。
+    边界：失败不写 CompactionEntry，原始会话保留；不改变 s07/s11 回退策略。
+    """
+
+    def __call__(
+        self,
+        messages_to_summarize: Sequence[Message],
+        previous_summary: str | None,
+    ) -> previous.SummaryResult:
+        """请求摘要并检查正文，只有成功结果才允许进入压缩落盘流程。"""
+        result = super().__call__(messages_to_summarize, previous_summary)
+        if result.text is None:
+            raise RuntimeError(
+                "摘要模型未返回正文，已停止本次任务，原始会话仍保留；"
+                "不会用缺少代码证据的回退摘要继续重复调用工具。"
+            )
+        return result
 
 
 # ===== s12 新增：技能目录 =====
@@ -177,8 +296,8 @@ def build_system_prompt(base_system: str, catalog: SkillCatalog) -> str:
     )
 
 
-# ===== 来自 s11：完整核心循环（保持） =====
-# s12 的技能读取属于普通工具调用，不在循环中增加技能专用分支。
+# ===== 来自 s11：完整核心循环（s12 增加请求轮数保护） =====
+# s12 的技能读取仍属于普通工具调用，不在循环中增加技能专用分支。
 
 
 def agent_loop(
@@ -193,23 +312,38 @@ def agent_loop(
     save_assistant: AssistantSaver | None = None,
     tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 8000,
+    # s12 新增：实际工具循环需要停止边界，避免模型反复搜索造成无限请求。
+    max_rounds: int = MAX_MODEL_ROUNDS,
 ) -> list[Message]:
     """运行带工具调用、会话保存和事件观察的 Agent 循环。
 
     输入：模型消息、请求器、工具分发器、含技能目录的 system、Hooks 和保存回调。
-    输出：本次运行的完整消息；没有工具调用或模型返回失败状态时结束。
+    输出：本次运行的完整消息；没有工具调用或模型返回失败状态时结束，超限时报错。
     流程：请求模型 → 保存 assistant 与 usage → 执行工具 → 保存结果 → 再次请求。
     技能正文与其他 read_file 结果一样进入会话，循环不决定模型选择哪项技能。
     """
+    # s12 修复：轮数只计算回答请求；摘要由请求包装器负责，不隐含在计数中。
+    if max_rounds < 1:
+        raise ValueError("max_rounds 必须为正整数")
     emit(AgentEvent(type="agent_start", data={"message_count": len(messages)}))
 
-    while True:
-        response = create_message(
-            system=system,
-            messages=messages,
-            tools=tools or TOOLS,
-            max_tokens=max_tokens,
-        )
+    for _ in range(max_rounds):
+        # s12 修复：摘要或回答请求失败同样结束本次任务，观察者不会收到悬空生命周期。
+        try:
+            response = create_message(
+                system=system,
+                messages=messages,
+                tools=tools or TOOLS,
+                max_tokens=max_tokens,
+            )
+        except (RuntimeError, ValueError):
+            emit(
+                AgentEvent(
+                    type="agent_end",
+                    data={"messages": list(messages), "reason": "request_failed"},
+                )
+            )
+            raise
         assistant_message = {
             "role": "assistant",
             "content": s05._to_jsonable(response.content),
@@ -266,6 +400,15 @@ def agent_loop(
         if save_message is not None:
             save_message(tool_message)
 
+    # s12 修复：保留已完成工具结果并报告未完成，不伪造一次模型最终回答。
+    emit(
+        AgentEvent(
+            type="agent_end",
+            data={"messages": list(messages), "reason": "max_rounds"},
+        )
+    )
+    raise RuntimeError(f"已达到 {max_rounds} 轮模型请求上限，任务尚未完成；已停止自动调用工具。")
+
 
 # ===== s12 修改：入口组装技能目录与实际系统提示词 =====
 
@@ -308,12 +451,13 @@ def main(arguments: Sequence[str] | None = None) -> None:
     summary_requester = BlockingModelRequester(provider, timeout_seconds, events.emit)
     assistant_requester = StreamingModelRequester(provider, timeout_seconds, events.emit)
 
-    # ===== 来自 s11：上下文与运行时组装（保持） =====
+    # ===== 来自 s11：上下文与运行时组装（本章仅修改空摘要策略） =====
     policy = CompactionPolicy(
         max_context_chars=_positive_int_env("SESSION_COMPACTION_MAX_CHARS", 24000),
         keep_recent_chars=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_CHARS", 12000),
     )
     summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
+    # s12 修复：空摘要向入口报告失败，不让压缩器生成缺失代码证据的回退摘要。
     summarizer = ContextSummarizer(
         create_message=summary_requester,
         max_tokens=summary_max_tokens,
