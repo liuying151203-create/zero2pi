@@ -18,6 +18,8 @@ Copy-Item .env.example .env
 
 在 `.env` 中填写模型密钥。若 PowerShell 不允许激活虚拟环境，可直接使用 `.venv\Scripts\python.exe`。
 
+s07–s12 还需填写实际 `MODEL_CONTEXT_WINDOW_TOKENS`；预算迁移与示例见 [s07 配置](s07_session_compaction/README.md#运行)，不要直接复制未经服务确认的模型容量。
+
 ## 常用命令
 
 ```powershell

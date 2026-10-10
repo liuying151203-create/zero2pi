@@ -129,6 +129,8 @@ s08：agent_loop → emit(event) → print_event
 
 ## 运行
 
+本章复用 [s07 的模型窗口预算](../s07_session_compaction/README.md#运行)，入口显式传入窗口、预留、近期 Token 和摘要额度；没有事件层专用阈值。旧字符参数不再读取，先填写实际 `MODEL_CONTEXT_WINDOW_TOKENS`。
+
 ```powershell
 # 创建 s08 专属会话并使用终端事件消费者
 python -m s08_runtime_events.code

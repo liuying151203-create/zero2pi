@@ -117,6 +117,8 @@ python -m s10_model_provider.code --session .sessions\s10\session-20260922-12000
 
 ## 参考与差异
 
+- 模型窗口与输出上限是不同能力。本章暂没有 Pi 的模型能力注册表：s07-s12 需显式配置实际 `MODEL_CONTEXT_WINDOW_TOKENS`，摘要输出额度也须符合服务限制；不会从 DeepSeek 等模型名称猜测容量。s11 使用统一 usage 校准压缩，s12 复用。
+
 - Pi 在独立 AI 包中统一多种 Provider、流式事件、模型元数据和费用。s10 保留“Provider 负责协议差异”的边界，但只实现当前项目实际配置的 Anthropic 与 OpenAI-compatible 两条路径，降低阅读成本。
 - lcc 的章节通常固定使用 Anthropic 客户端。s10 保留其单文件可运行结构，但让 Agent loop 依赖项目内部响应，解决 DeepSeek 等 Chat Completions 服务不能仅靠 Base URL 接入的问题。
 - s11 将直接读取 `ModelResponse.usage` 实现追踪与统计，以验证统一响应不仅支持切换模型，也能复用上层运行组件。

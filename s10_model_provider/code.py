@@ -800,10 +800,16 @@ def main(arguments: Sequence[str] | None = None) -> None:
     session_path = s05.session_path_from_cli(arguments, session_root=SESSION_ROOT)
     session = SessionManager.open(session_path)
     policy = CompactionPolicy(
-        max_context_chars=_positive_int_env("SESSION_COMPACTION_MAX_CHARS", 24000),
-        keep_recent_chars=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_CHARS", 12000),
+        # 来自 s07：保持；模型窗口、预留和近期预算分别组装，不再读取旧字符阈值。
+        context_window_tokens=_positive_int_env("MODEL_CONTEXT_WINDOW_TOKENS", 0),
+        reserve_tokens=_positive_int_env("SESSION_COMPACTION_RESERVE_TOKENS", 16384),
+        keep_recent_tokens=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_TOKENS", 20000),
     )
-    summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
+    # 来自 s07：保持；摘要默认额度来自预留预算，不改变正常回答请求的额度。
+    summary_default_tokens = int(policy.reserve_tokens * 0.8)
+    summary_max_tokens = _positive_int_env(
+        "SESSION_COMPACTION_SUMMARY_MAX_TOKENS", summary_default_tokens
+    )
     # s10 修复：摘要选项单独组装，OpenAI-compatible 不接收 Anthropic 的 thinking 字段。
     summary_options = summary_request_options(provider)
     summarizer = ContextSummarizer(

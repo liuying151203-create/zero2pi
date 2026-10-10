@@ -25,6 +25,8 @@ from typing import Any
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+# 来自 s02：保持；预算及底层窗口复用，工作区路径仍由本章检查。
+from s02_tool_use import code as tools_chapter
 from zero2pi.model import ModelRequester
 from zero2pi.ui import (
     format_assistant_message,
@@ -57,8 +59,14 @@ SYSTEM = (
 
 # ===== 来自 s02：工具处理函数（保持） =====
 
+
 def run_bash(command: str) -> str:
-    """在工作目录执行 shell 命令。"""
+    """在权限检查通过后执行 shell，复用 s02 的结果预算。
+
+    输入：命令文本；输出：末尾结果、存档路径或退出失败文本。
+    流程：本章工作目录执行 → 合并输出 → s02 截取/存档 → 报告退出状态。
+    本方法不判断权限；check_permission 和 execute_tool 在分发前完成门禁。
+    """
     try:
         result = subprocess.run(
             command,
@@ -76,7 +84,11 @@ def run_bash(command: str) -> str:
         return f"Error: {error}"
 
     output = (result.stdout + result.stderr).strip()
-    return output or "(no output)"
+    # 来自 s02：保持；shell 返回末尾有界输出，并报告非零退出码。
+    bounded_output = tools_chapter._limit_shell_output(output, WORKDIR)
+    if result.returncode:
+        return f"Error: command exited with code {result.returncode}\n{bounded_output}"
+    return bounded_output
 
 
 def safe_path(path: str) -> Path:
@@ -92,22 +104,27 @@ def run_read(
     limit: int | None = None,
     start_line: int = 1,
 ) -> str:
-    """读取工作区文本文件，可从指定行开始并限制返回行数。"""
-    try:
-        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
-        if start_line < 1:
-            raise ValueError("start_line must be at least 1")
-        if limit is not None and limit < 1:
-            raise ValueError("limit must be at least 1")
+    """在本章路径边界内复用 s02 的有界文件读取。
 
-        # 来自 s02：保持；局部读取仍属于 read_file，只读权限策略无需增加分支。
-        start_index = start_line - 1
-        if start_index >= len(lines):
-            return f"(start_line {start_line} exceeds file length {len(lines)})"
-        selected = lines[start_index:]
-        if limit is not None and limit < len(selected):
-            selected = selected[:limit] + [f"... ({len(selected) - limit} more lines)"]
-        return "\n".join(selected)
+    输入：路径、一基起始行与可选行数；输出：正文、继续位置或错误文本。
+    流程：safe_path 校验工作区 → s02 按行和字节预算读取 → 返回，不改变权限决定。
+    """
+    try:
+        # 来自 s02：保持；读取窗口不重写预算策略，本章只提供已校验的路径。
+        return tools_chapter._read_file_window(safe_path(path), start_line, limit)
+    except (OSError, UnicodeError, ValueError) as error:
+        return f"Error: {error}"
+
+
+# 来自 s02：保持；内容搜索使用同一字面匹配与输出预算，仍由本章检查路径。
+def run_grep(path: str, pattern: str, limit: int = 100) -> str:
+    """在本章工作区内定位文件内容，不执行 shell。
+
+    输入：文件路径、字面搜索文本和匹配上限；输出：路径、行号和匹配行或错误文本。
+    流程：校验路径 → 复用 s02 搜索预算 → 返回定位结果；是否放行由 check_permission 决定。
+    """
+    try:
+        return tools_chapter._search_file(safe_path(path), pattern, limit)
     except (OSError, UnicodeError, ValueError) as error:
         return f"Error: {error}"
 
@@ -157,9 +174,12 @@ def run_glob(pattern: str) -> str:
 # ===== 来自 s02：工具定义和注册表（保持） =====
 
 TOOLS = [
+    # 来自 s02：保持；搜索定义无需在权限章节重新描述。
+    next(tool for tool in tools_chapter.TOOLS if tool["name"] == "grep"),
     {
         "name": "bash",
-        "description": "Run one shell command in the current workspace. On Windows, use cmd.exe syntax.",
+        # 来自 s02：保持；描述与实际输出预算对应，不在权限层引入新预算。
+        "description": "执行工作区 shell 命令；Windows 使用 cmd.exe。返回末尾最多 2000 行 / 50 KiB，超长全文另存。",
         "input_schema": {
             "type": "object",
             "properties": {"command": {"type": "string"}},
@@ -168,9 +188,10 @@ TOOLS = [
     },
     {
         "name": "read_file",
+        # 来自 s02：保持；读取窗口与说明一致。
         "description": (
-            "Read a UTF-8 workspace file. For large files, use one-based start_line "
-            "with limit to read only the needed range."
+            "读取工作区 UTF-8 文件，最多 2000 行 / 50 KiB。"
+            "用 start_line（一基行号）和 limit 读取目标范围；按返回的继续位置补读。"
         ),
         "input_schema": {
             "type": "object",
@@ -221,6 +242,8 @@ TOOLS = [
 TOOL_HANDLERS: dict[str, ToolHandler] = {
     "bash": run_bash,
     "read_file": run_read,
+    # 来自 s02：保持；工具注册与核心循环不涉及权限职责。
+    "grep": run_grep,
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
@@ -228,6 +251,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 
 
 # ===== s03 新增：权限状态与判断结果 =====
+
 
 class PermissionStatus(StrEnum):
     """工具调用经过权限检查后的三种状态。
@@ -261,7 +285,8 @@ class PermissionDecision:
 PermissionCheck = Callable[[str, dict[str, Any]], PermissionDecision]
 PermissionConfirm = Callable[[str, dict[str, Any], str], bool]
 
-_READ_ONLY_TOOLS = {"read_file", "glob"}
+# s03 修改：内容搜索是专用只读工具，不能放宽任意 shell 命令的权限。
+_READ_ONLY_TOOLS = {"read_file", "glob", "grep"}
 _WRITE_TOOLS = {"write_file", "edit_file"}
 _HARD_DENY_PATTERNS = (
     re.compile(r"\b(?:format|diskpart|mkfs)\b", re.IGNORECASE),
@@ -306,7 +331,8 @@ def check_permission(name: str, arguments: dict[str, Any]) -> PermissionDecision
     if name not in TOOL_HANDLERS:
         return PermissionDecision(PermissionStatus.DENY, f"未知工具：{name}")
 
-    if name in {"read_file", "write_file", "edit_file"}:
+    # s03 修改：grep 与文件读取一样，先检查路径再自动放行。
+    if name in {"read_file", "write_file", "edit_file", "grep"}:
         try:
             safe_path(str(arguments.get("path", "")))
         except ValueError:
@@ -336,6 +362,7 @@ def confirm_permission(name: str, arguments: dict[str, Any], reason: str) -> boo
 
 # ===== 来自 s02：统一工具分发（保持） =====
 
+
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
     """执行一个已经通过调用入口的工具分发请求。
 
@@ -358,6 +385,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
 
 
 # ===== s03 新增：权限门禁执行入口 =====
+
 
 def execute_tool(
     name: str,
@@ -392,6 +420,7 @@ def execute_tool(
 
 # ===== 来自 s02：响应读取辅助（保持） =====
 
+
 def _get(block: Any, name: str) -> Any:
     """兼容读取 SDK 对象和测试替身中的字段。"""
     if isinstance(block, dict):
@@ -401,6 +430,7 @@ def _get(block: Any, name: str) -> Any:
 
 # ===== 来自 s02：核心循环；s03 修改工具执行入口 =====
 # s02 直接 dispatch；s03 在这里统一经过 execute_tool，拒绝结果仍会回到模型。
+
 
 def agent_loop(
     messages: list[Message],
@@ -431,11 +461,7 @@ def agent_loop(
         )
         messages.append({"role": "assistant", "content": response.content})
 
-        tool_calls = [
-            block
-            for block in response.content
-            if _get(block, "type") == "tool_use"
-        ]
+        tool_calls = [block for block in response.content if _get(block, "type") == "tool_use"]
         if not tool_calls:
             return messages
 
@@ -466,6 +492,7 @@ def agent_loop(
 
 
 # ===== 来自 s02：终端输出和交互入口；s03 修改权限配置 =====
+
 
 def _text_from_content(content: Any) -> str:
     """提取模型响应中的文本块，用于终端展示。"""

@@ -105,11 +105,7 @@ def print_event(event: AgentEvent) -> None:
     elif event.type == "tool_result":
         print(format_tool_result(event.data["output"]), flush=True)
     elif event.type == "compaction":
-        source = (
-            "模型摘要"
-            if event.data["summary_kind"] == "model"
-            else "确定性回退摘要"
-        )
+        source = "模型摘要" if event.data["summary_kind"] == "model" else "确定性回退摘要"
         print(
             "会话  已压缩 "
             f"{event.data['before_chars']} → {event.data['after_chars']} 字符，"
@@ -240,9 +236,7 @@ def agent_loop(
         emit(AgentEvent(type="assistant_message", data={"message": assistant_message}))
 
         tool_calls = [
-            block
-            for block in assistant_message["content"]
-            if _get(block, "type") == "tool_use"
+            block for block in assistant_message["content"] if _get(block, "type") == "tool_use"
         ]
         if not tool_calls:
             # s08 新增：显式报告本轮 Agent 已结束，消费者无需推测循环退出位置。
@@ -318,10 +312,16 @@ def main(arguments: Sequence[str] | None = None) -> None:
     session_path = s05.session_path_from_cli(arguments, session_root=SESSION_ROOT)
     session = SessionManager.open(session_path)
     policy = CompactionPolicy(
-        max_context_chars=_positive_int_env("SESSION_COMPACTION_MAX_CHARS", 24000),
-        keep_recent_chars=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_CHARS", 12000),
+        # 来自 s07：保持；模型窗口、预留和近期预算分别组装，不再读取旧字符阈值。
+        context_window_tokens=_positive_int_env("MODEL_CONTEXT_WINDOW_TOKENS", 0),
+        reserve_tokens=_positive_int_env("SESSION_COMPACTION_RESERVE_TOKENS", 16384),
+        keep_recent_tokens=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_TOKENS", 20000),
     )
-    summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
+    # 来自 s07：保持；摘要默认额度来自预留预算，不改变正常回答请求的额度。
+    summary_default_tokens = int(policy.reserve_tokens * 0.8)
+    summary_max_tokens = _positive_int_env(
+        "SESSION_COMPACTION_SUMMARY_MAX_TOKENS", summary_default_tokens
+    )
     summarizer = ContextSummarizer(
         create_message=requester,
         max_tokens=summary_max_tokens,

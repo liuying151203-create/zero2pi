@@ -76,6 +76,8 @@ model_request
 
 ## 运行
 
+本章复用 [s07 的模型窗口预算](../s07_session_compaction/README.md#运行)，入口显式传入窗口、预留、近期 Token 和摘要额度；流式显示不会另设压缩阈值。旧字符参数不再读取，先填写实际 `MODEL_CONTEXT_WINDOW_TOKENS`。
+
 ```powershell
 # 创建 s09 专属会话并流式显示正常回答
 python -m s09_runtime_streaming.code

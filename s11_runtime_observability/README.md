@@ -29,6 +29,8 @@ s11 通过 Event 显示运行过程、记录紧凑 Trace 和统计本轮指标�
 | `SessionStats` | 遍历全部会话记录，重算调用数、工具调用数和用量 | 会话统计文本 |
 | `_summary_response_details()` | 统计空摘要的响应结构，不记录原文 | 类型、长度、停止原因、请求选项与用量 |
 | `show_summary_diagnostic()` | 消费空摘要事件显示诊断 | 一行终端信息 |
+| `estimate_session_context_tokens()` | 最近有效回答 usage + 后续新增消息估算 | 当前上下文大小，不是会话累计消费 |
+| `model_round_limit_from_env()` | 读取独立的可选运行保护 | `round_limit`，通过 `max_rounds` 传给循环 |
 
 Trace 只保存运行事实和工具结果预览，不复制完整对话。模型上下文仍由会话投影生成，只含对话消息、最新摘要和保留尾部，不含 usage、模型名称等统计字段。
 
@@ -36,7 +38,8 @@ Trace 只保存运行事实和工具结果预览，不复制完整对话。模�
 
 ```mermaid
 flowchart LR
-    A[用户输入] --> B{需要压缩?}
+    A[用户输入] --> U[最近有效回答 usage 加后续消息估算]
+    U --> B{超过模型窗口减预留?}
     B -- 是 --> C[摘要模型请求]
     C -- 生成摘要 --> D[保存 CompactionEntry；有模型摘要时附 usage]
     C -- 空响应或异常 --> J[保存 ModelErrorEntry 与可用用量]
@@ -61,6 +64,9 @@ flowchart TB
     A[BlockingModelRequester] -->|create_message| B[ContextSummarizer]
     B -->|summarize: SummaryResult| C[ContextCompactor]
     D[SessionManager] -->|session| C
+    D -->|load_entries: entries| R[estimate_session_context_tokens]
+    R -->|context_tokens| C
+    S[s07 CompactionPolicy] -->|policy| C
     D -->|session| E[SessionErrorRecorder]
     D -->|session| F[CompactedContextRequester]
     C -->|compactor| F
@@ -72,6 +78,8 @@ flowchart TB
     P[s10 summary_request_options] -->|request_options: summary_options| B
     B -->|summary_empty: response_details| H
     H -->|事件；观察者通过 subscribe 注册| Q[show_summary_diagnostic]
+    M[AGENT_MAX_ROUNDS] -->|环境配置| T[model_round_limit_from_env]
+    T -->|max_rounds: round_limit| V[agent_loop]
 ```
 
 `main()` 先打开会话，再组装观察者、两个模型请求器、摘要器和压缩器，最后把 `request_with_context` 与 `session.append_assistant` 传给 `agent_loop`。终端每轮显示“本轮”和“会话累计”两行，后者每次从会话 JSONL 重算模型请求、Token 和工具调用次数。工具耗时与工具错误次数目前只在本轮事件中统计。
@@ -93,7 +101,13 @@ flowchart TB
 - 出现未知内容块：检查响应结构及解析规则；不能直接当作摘要。
 - 内容块为空：这里只知道转换后的响应为空，仍需检查 Provider 转换及上游返回。
 
-单次自然语言任务最多 12 轮回答请求（不计摘要请求）；耗尽上限时报未完成，保留已经执行的工具结果。请求失败同样发出结束事件。s12 复用这套运行时保护，同时保留自己的完整循环源码供阅读。
+## 上下文用量与可选运行保护
+
+`ContextCompactor` 先加载 `entries`，调用 `estimate_session_context_tokens(entries)`，再把 `context_tokens` 传入 s07 的准备函数。最近有效 assistant 的 usage 包括该次上下文和输出；之后新增消息尚未被模型统计，使用 s07 的近似估算。错误、未知用量和 `ModelErrorEntry` 不作为基准；遇到最新压缩点就停止回溯，压缩前旧 usage 与摘要 usage 都不能代表新投影。没有有效基准时估算完整投影。
+
+运行保护与这些预算独立。在 `.env` 设置 `AGENT_MAX_ROUNDS=0`（默认）表示不设置固定轮数上限，模型继续工具调用直到自行结束、请求失败或用户中断。正整数例如 `AGENT_MAX_ROUNDS=30` 才限制回答请求轮数，不计摘要；耗尽时报未完成并保留结果。不是“增加上限保证成功”，没有额外强制收尾请求，也不伪造最终回答。
+
+s12 复用配置函数并完整展开同一循环。默认无轮数上限有持续调用和消费的风险，可按任务选择显式上限；手动中断仍由终端处理。
 
 查看当前章节最新 Trace 的诊断（运行 s12 时将路径改为 `.traces\s12\*.jsonl`）：
 
@@ -115,4 +129,5 @@ python -m s11_runtime_observability.code --session .sessions\s11\session-2026092
 ## 参考与差异
 
 - Pi 把回答用量放在 assistant 消息、摘要用量放在 compaction entry，并遍历完整会话统计。s11 采用相同的归属方式；本项目摘要重试产生的空响应，以及无消息的调用异常，用 `ModelErrorEntry` 保留用量。
+- Pi 用最近有效 usage 校准上下文，核心循环提供可注入停止回调而非固定 12 轮。本章使用已有会话元数据实现同样的估算思路；停止保护仅保留当前实际使用的可选 `max_rounds`，不提前增加新的 Hook 接口。s12 复用；测试验证超过 12 轮可正常结束、显式上限仍有效。
 - lcc 用小章节逐步展示 Agent 机制。s11 延续这种可运行的章节结构；Event 负责运行观察，Session 保存可恢复的完整事实，两者各有明确用途。

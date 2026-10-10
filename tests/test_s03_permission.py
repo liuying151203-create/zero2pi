@@ -23,7 +23,8 @@ def test_ranged_read_stays_read_only_and_returns_requested_lines(tmp_path, monke
     result = chapter.dispatch_tool("read_file", arguments)
 
     assert decision.status is chapter.PermissionStatus.ALLOW
-    assert result == "two\nthree\n... (1 more lines)"
+    assert result.startswith("two\nthree\n\n[")
+    assert "start_line=4" in result
 
 
 def test_writes_need_confirmation_and_path_escape_is_denied(tmp_path, monkeypatch) -> None:
@@ -47,6 +48,22 @@ def test_bash_rules_distinguish_allow_ask_and_deny() -> None:
     )
     assert chapter.check_permission("bash", {"command": "format C:"}).status is (
         chapter.PermissionStatus.DENY
+    )
+
+
+def test_grep_is_read_only_but_outside_paths_are_denied(tmp_path, monkeypatch):
+    monkeypatch.setattr(chapter, "WORKDIR", tmp_path)
+    (tmp_path / "code.py").write_text("def scan():\n    pass", encoding="utf-8")
+    arguments = {"path": "code.py", "pattern": "def scan"}
+    assert chapter.check_permission("grep", arguments).status == chapter.PermissionStatus.ALLOW
+    assert ":1: def scan" in chapter.dispatch_tool("grep", arguments)
+    arguments["path"] = "../outside.py"
+    assert chapter.check_permission("grep", arguments).status == chapter.PermissionStatus.DENY
+    assert (
+        chapter.check_permission(
+            "bash", {"command": "cd /d D:\\repo && findstr scan code.py"}
+        ).status
+        == chapter.PermissionStatus.ASK
     )
 
 

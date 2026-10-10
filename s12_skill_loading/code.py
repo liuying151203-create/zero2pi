@@ -16,19 +16,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any
-from uuid import uuid4
 
 import yaml
 from dotenv import load_dotenv
 
-# 来自 s03：保持；复用文件工具的工作区边界，不改变权限判断。
-from s03_permission import code as s03
 from s05_session_persistence import code as s05
 from s11_runtime_observability import code as previous
 from zero2pi.ui import format_error, format_user_prompt
 
 # ===== 来自 s11：运行时与工具依赖（保持） =====
-# 会话、模型请求、权限和观察者复用 s11；工具返回与空摘要保护在本章就地展开。
+# 会话、模型请求、工具、权限和观察者复用 s11；本章只增加技能目录。
 
 Message = previous.Message
 ModelResponse = previous.ModelResponse
@@ -64,106 +61,12 @@ SESSION_ROOT = Path(".sessions/s12")
 TRACE_ROOT = Path(".traces/s12")
 # s12 新增：只发现本章项目内的技能，目录相对启动工作区解析。
 SKILLS_ROOT = Path("s12_skill_loading/skills")
-# s12 修复：采用小窗口减少工具结果占用；思考内容仍可能超预算，由空摘要保护停止。
-READ_MAX_LINES = 80
-TOOL_OUTPUT_MAX_CHARS = 4000
-# 来自 s11：保持；单次任务轮数保护属于运行时，不在 Skills 章节单独定义策略。
-MAX_MODEL_ROUNDS = previous.MAX_MODEL_ROUNDS
-
-# s12 修改：只更新本章工具说明，不修改 s11 的共享定义；执行层仍强制限制输出。
-TOOLS = [dict(tool) for tool in previous.TOOLS]
-for tool in TOOLS:
-    if tool["name"] == "read_file":
-        tool["description"] = (
-            f"读取工作区 UTF-8 文件，每次最多 {READ_MAX_LINES} 行、"
-            f"{TOOL_OUTPUT_MAX_CHARS} 字符正文。"
-            "使用 start_line 和 limit 读取目标范围；需要全文时按返回的 start_line 继续读取。"
-        )
-    elif tool["name"] == "bash":
-        tool["description"] += (
-            f" 返回最多 {TOOL_OUTPUT_MAX_CHARS} 字符正文，超出内容另存文件。"
-            "搜索限定到任务相关目录，避免递归扫描 .venv；无结果时不要反复重试等价命令。"
-        )
-
-
-# ===== s12 修复：有界工具返回 =====
-
-
-def read_file(path: str, start_line: int = 1, limit: int | None = None) -> str:
-    """按完整行读取目标窗口，避免整个代码文件立即触发压缩。
-
-    输入：工作区内的文件路径、一基起始行和可选行数。
-    输出：不超过行数及字符预算的正文；未读完时附上下一次 start_line。
-    流程：复用 s03 路径校验 → 读取文本 → 按两种预算收集完整行 → 提示继续位置。
-    边界：技能全文也可分段读取；单行本身超预算时报告错误，不伪装成完整内容。
-    """
-    try:
-        if start_line < 1 or (limit is not None and limit < 1):
-            raise ValueError("start_line 和 limit 必须为正整数")
-        lines = s03.safe_path(path).read_text(encoding="utf-8").splitlines()
-        if start_line > len(lines):
-            return f"(start_line {start_line} exceeds file length {len(lines)})"
-
-        # s12 修复：即使模型不传 limit 或传入大值，也不能取消工具输出预算。
-        line_limit = min(limit if limit is not None else READ_MAX_LINES, READ_MAX_LINES)
-        selected: list[str] = []
-        chars = 0
-        for line in lines[start_line - 1 : start_line - 1 + line_limit]:
-            line_chars = len(line) + (1 if selected else 0)
-            if chars + line_chars > TOOL_OUTPUT_MAX_CHARS:
-                break
-            selected.append(line)
-            chars += line_chars
-        if not selected:
-            return f"Error: 第 {start_line} 行超过字符预算，无法按完整行读取；请说明此限制。"
-
-        output = "\n".join(selected)
-        next_line = start_line + len(selected)
-        if next_line <= len(lines):
-            # s12 修复：下一行根据实际返回行数计算，字符截断也不会跳过未读代码。
-            output += (
-                f"\n\n[已显示第 {start_line}-{next_line - 1} 行，共 {len(lines)} 行；"
-                f"需要更多内容时用 read_file(start_line={next_line}, limit={READ_MAX_LINES})。]"
-            )
-        return output
-    except (OSError, UnicodeError, ValueError) as error:
-        return f"Error: {error}"
-
-
-def dispatch_tool(name: str, arguments: dict[str, Any]) -> str:
-    """分发已通过 Hooks 的工具调用，并限制返回给模型的文本。
-
-    输入：工具名称和参数；权限仍由 execute_tool 在分发前检查。
-    输出：有界结果或错误文本；非文件读取的超长结果附带完整结果路径。
-    流程：read_file 使用本章窗口 → 其他工具复用 s11 → 超长结果存档并返回预览。
-    边界：限制模型输入，不是 shell 沙箱；完整 shell 输出仍会先在内存中生成。
-    """
-    if name == "read_file":
-        try:
-            return read_file(**arguments)
-        except TypeError as error:
-            return f"Error: invalid arguments for read_file: {error}"
-    output = previous.dispatch_tool(name, arguments)
-    if len(output) <= TOOL_OUTPUT_MAX_CHARS:
-        return output
-
-    # s12 修复：参考 Pi 的 shell 输出存档；只把有界预览送入 JSONL 与模型上下文。
-    output_path = SESSION_ROOT / "tool-results" / f"{uuid4().hex}.txt"
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(output, encoding="utf-8")
-    except OSError as error:
-        return f"Error: 无法保存完整工具结果：{error}"
-    return (
-        output[:TOOL_OUTPUT_MAX_CHARS]
-        + f"\n\n[输出已截断，原文 {len(output)} 字符；完整结果：{output_path.as_posix()}。"
-        "请缩小搜索范围，不要整份重读存档。]"
-    )
-
-
-# 来自 s11：保持；摘要诊断与失败策略归属运行时，本章不另写摘要实现。
+# 来自 s11：保持；工具预算、摘要策略与运行保护不属于 Skills，直接复用。
+TOOLS = previous.TOOLS
+dispatch_tool = previous.dispatch_tool
 ContextSummarizer = previous.ContextSummarizer
 show_summary_diagnostic = previous.show_summary_diagnostic
+model_round_limit_from_env = previous.model_round_limit_from_env
 
 
 # ===== s12 新增：技能目录 =====
@@ -295,8 +198,8 @@ def agent_loop(
     save_assistant: AssistantSaver | None = None,
     tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 8000,
-    # 来自 s11：保持；实际工具循环需要停止边界，避免模型反复搜索造成无限请求。
-    max_rounds: int = MAX_MODEL_ROUNDS,
+    # 来自 s11：保持；限轮仅在调用方明确配置时启用，不是默认完成策略。
+    max_rounds: int | None = None,
 ) -> list[Message]:
     """运行带工具调用、会话保存和事件观察的 Agent 循环。
 
@@ -306,11 +209,15 @@ def agent_loop(
     技能正文与其他 read_file 结果一样进入会话，循环不决定模型选择哪项技能。
     """
     # 来自 s11：保持；轮数只计算回答请求；摘要由请求包装器负责，不隐含在计数中。
-    if max_rounds < 1:
+    # 来自 s11：保持；默认不限制轮数，有明确配置时才停止。
+    if max_rounds is not None and max_rounds < 1:
         raise ValueError("max_rounds 必须为正整数")
     emit(AgentEvent(type="agent_start", data={"message_count": len(messages)}))
 
-    for _ in range(max_rounds):
+    # 来自 s11：保持；显式统计回答请求，None 时不设置硬停止点。
+    round_count = 0
+    while max_rounds is None or round_count < max_rounds:
+        round_count += 1
         # 来自 s11：保持；摘要或回答请求失败同样结束本次任务，观察者不会收到悬空生命周期。
         try:
             response = create_message(
@@ -438,10 +345,16 @@ def main(arguments: Sequence[str] | None = None) -> None:
 
     # ===== 来自 s11：上下文与运行时组装（保持） =====
     policy = CompactionPolicy(
-        max_context_chars=_positive_int_env("SESSION_COMPACTION_MAX_CHARS", 24000),
-        keep_recent_chars=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_CHARS", 12000),
+        # 来自 s07：保持；模型窗口、预留和近期预算分别组装，不再读取旧字符阈值。
+        context_window_tokens=_positive_int_env("MODEL_CONTEXT_WINDOW_TOKENS", 0),
+        reserve_tokens=_positive_int_env("SESSION_COMPACTION_RESERVE_TOKENS", 16384),
+        keep_recent_tokens=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_TOKENS", 20000),
     )
-    summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
+    # 来自 s07：保持；摘要默认额度来自预留预算，不改变正常回答请求的额度。
+    summary_default_tokens = int(policy.reserve_tokens * 0.8)
+    summary_max_tokens = _positive_int_env(
+        "SESSION_COMPACTION_SUMMARY_MAX_TOKENS", summary_default_tokens
+    )
     # 来自 s11：保持；摘要请求策略由 s07 定义、s10 适配，本章只组装已有组件。
     summary_options = summary_request_options(provider)
     summarizer = ContextSummarizer(
@@ -459,6 +372,8 @@ def main(arguments: Sequence[str] | None = None) -> None:
         emit=events.emit,
     )
     hooks = Hooks(before_tool_call=[make_permission_hook()])
+    # 来自 s11：保持；运行保护独立于技能加载，通过参数显式注入。
+    round_limit = model_round_limit_from_env()
 
     # s12 修改：交互入口显示技能数，用户可观察是否扫描成功。
     print("s12：能力系统 · Skills 按需加载")
@@ -466,6 +381,11 @@ def main(arguments: Sequence[str] | None = None) -> None:
     print(f"模型：{provider.model}")
     print(f"会话文件：{session.path}")
     print(f"Trace 文件：{trace_path}")
+    # 来自 s11：保持；展示已组装的预算与可选上限，不增加技能专属配置。
+    print(
+        f"上下文配置：窗口 {policy.context_window_tokens}，触发 {policy.trigger_tokens}，近期保留 {policy.keep_recent_tokens} Token。"
+    )
+    print(f"回答轮数上限：{round_limit if round_limit is not None else '不限制'}")
     print(f"可用技能：{len(skill_catalog.skills)} 项")
     print("输入任务，输入 q 退出。\n")
 
@@ -493,6 +413,8 @@ def main(arguments: Sequence[str] | None = None) -> None:
                 emit=events.emit,
                 save_message=session.append_message,
                 save_assistant=session.append_assistant,
+                # 来自 s11：保持；未配置上限时不会在第 12 轮直接退出。
+                max_rounds=round_limit,
             )
         except (RuntimeError, ValueError) as error:
             print(format_error(str(error)), file=sys.stderr)

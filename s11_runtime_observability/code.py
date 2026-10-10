@@ -40,8 +40,6 @@ from zero2pi.ui import (
 # s11 修改：会话和 Trace 按章节隔离，便于分别检查模型上下文与运行事实。
 SESSION_ROOT = Path(".sessions/s11")
 TRACE_ROOT = Path(".traces/s11")
-# s11 修复：运行时限制单次任务的回答请求轮数，后续章节复用，不绑定技能机制。
-MAX_MODEL_ROUNDS = 12
 
 # ===== 来自 s10：Provider、Agent、工具与会话依赖（保持） =====
 # s11 保留工具与 Hooks；会话 Entry 在下方增加用量字段。
@@ -1016,7 +1014,33 @@ class ContextSummarizer:
         )
 
 
-# s11 修改：相对 s07，压缩器把成功摘要的用量随 CompactionEntry 落盘。
+# s11 新增：参考 Pi，用最近有效回答的 usage 校准上下文，而非累计整个会话的消费。
+def estimate_session_context_tokens(entries: Sequence[SessionEntry]) -> int:
+    """估算当前投影占用的 Token，优先使用压缩点之后的有效回答用量。
+
+    输入：按时间排列的会话 Entry。
+    输出：最近有效回答的上下文用量加后续新增消息估算；没有有效 usage 时估算完整投影。
+    流程：逆序寻找回答 → 排除失败和未知用量 → 加上后续消息；遇到压缩点停止回溯。
+    边界：旧压缩前的 usage 对新投影已失效；摘要请求用量不是正常回答的上下文大小。
+    """
+    for index in range(len(entries) - 1, -1, -1):
+        entry = entries[index]
+        if isinstance(entry, CompactionEntry):
+            break
+        if (
+            isinstance(entry, MessageEntry)
+            and entry.message.get("role") == "assistant"
+            and entry.stop_reason not in {"error", "aborted"}
+            and _known_usage(entry.usage) is not None
+        ):
+            later_messages = [
+                later.message for later in entries[index + 1 :] if isinstance(later, MessageEntry)
+            ]
+            return entry.usage.total_tokens + s07.estimate_context_tokens(later_messages)
+    return s07.estimate_context_tokens(s07.build_session_context(entries))
+
+
+# s11 修改：压缩器保存成功摘要的用量；触发判断由已有 usage 校准。
 class ContextCompactor:
     """执行 s07 的上下文压缩，并把摘要请求的用量写入压缩记录。
 
@@ -1036,8 +1060,17 @@ class ContextCompactor:
         self.summarize = summarize
 
     def compact_if_needed(self) -> s07.CompactionOutcome | None:
-        """压缩超限上下文，并让每次摘要请求随本次压缩持久化。"""
-        plan = s07.prepare_compaction(self.session.load_entries(), self.policy)
+        """校准上下文大小，再执行压缩并持久化成功摘要的用量。
+
+        输入：实例中的会话、Token 策略与摘要器。
+        输出：不需要压缩时返回 None；成功返回大小统计；摘要失败或大小校验失败时报错。
+        流程：读取 entries → 用有效 usage 估算 → s07 准备计划 → 摘要 → 复核 → 保存。
+        未形成压缩记录的失败请求仍保留用量，不用会话累计消费判断当前上下文。
+        """
+        # s11 修改：实际上下文用量与会话累计统计分开，准备阶段不依赖 Provider 类型。
+        entries = self.session.load_entries()
+        context_tokens = estimate_session_context_tokens(entries)
+        plan = s07.prepare_compaction(entries, self.policy, context_tokens=context_tokens)
         if plan is None:
             return None
 
@@ -1063,7 +1096,7 @@ class ContextCompactor:
                     "summary",
                     summary_result.usage,
                 )
-            raise RuntimeError("压缩后上下文仍超过字符阈值")
+            raise RuntimeError("压缩后上下文仍超过 Token 预算的近似字符上限")
 
         # s11 修改：参考 Pi，成功摘要的用量随 CompactionEntry 保存；空响应已单独落盘。
         self.session.append_compaction(
@@ -1138,8 +1171,8 @@ def agent_loop(
     save_assistant: AssistantSaver | None = None,
     tools: list[dict[str, Any]] | None = None,
     max_tokens: int = 8000,
-    # s11 新增：实际工具循环需要停止边界，避免模型反复搜索造成无限请求。
-    max_rounds: int = MAX_MODEL_ROUNDS,
+    # s11 修改：限轮只在调用方明确配置时启用，不作为默认任务完成策略。
+    max_rounds: int | None = None,
 ) -> list[Message]:
     """运行带工具调用、会话保存和事件观察的 Agent 循环。
 
@@ -1149,11 +1182,15 @@ def agent_loop(
     事件观察与失败停止由运行时负责，不绑定某项技能或具体任务。
     """
     # s11 修复：轮数只计算回答请求；摘要由请求包装器负责，不隐含在计数中。
-    if max_rounds < 1:
+    # s11 修改：参考 Pi/lcc，默认随工具调用继续；轮数上限只是可选运行保护。
+    if max_rounds is not None and max_rounds < 1:
         raise ValueError("max_rounds 必须为正整数")
     emit(AgentEvent(type="agent_start", data={"message_count": len(messages)}))
 
-    for _ in range(max_rounds):
+    # s11 修改：显式统计回答请求，None 时持续工具循环，有限上限时按实际轮数停止。
+    round_count = 0
+    while max_rounds is None or round_count < max_rounds:
+        round_count += 1
         # s11 修复：摘要或回答请求失败同样结束本次任务，观察者不会收到悬空生命周期。
         try:
             response = create_message(
@@ -1243,6 +1280,20 @@ def agent_loop(
 # ===== s11 修改：按观察层、模型层、上下文层和循环层显式组装 =====
 
 
+# s11 修改：把运行保护配置与上下文预算分开，0 表示不启用固定轮数限制。
+def model_round_limit_from_env() -> int | None:
+    """读取 AGENT_MAX_ROUNDS，返回可选回答请求上限。
+
+    输入：环境变量，未填写时使用 0。
+    输出：正整数表示限制，0 转为 None 表示默认继续；负数或非整数报错。
+    流程：解析配置 → 校验范围 → 交给 agent_loop，不影响摘要请求额度。
+    """
+    value = int(os.getenv("AGENT_MAX_ROUNDS", "0"))
+    if value < 0:
+        raise ValueError("AGENT_MAX_ROUNDS 不能小于 0")
+    return value or None
+
+
 def main(arguments: Sequence[str] | None = None) -> None:
     """启动带 Trace 和用量统计的流式 Agent。
 
@@ -1294,10 +1345,16 @@ def main(arguments: Sequence[str] | None = None) -> None:
 
     # s11 修改：摘要器把每次响应的 usage 显式传给压缩器，随后进入 CompactionEntry。
     policy = CompactionPolicy(
-        max_context_chars=_positive_int_env("SESSION_COMPACTION_MAX_CHARS", 24000),
-        keep_recent_chars=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_CHARS", 12000),
+        # 来自 s07：保持；模型窗口、预留和近期预算分别组装，不再读取旧字符阈值。
+        context_window_tokens=_positive_int_env("MODEL_CONTEXT_WINDOW_TOKENS", 0),
+        reserve_tokens=_positive_int_env("SESSION_COMPACTION_RESERVE_TOKENS", 16384),
+        keep_recent_tokens=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_TOKENS", 20000),
     )
-    summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
+    # 来自 s07：保持；摘要默认额度来自预留预算，不改变正常回答请求的额度。
+    summary_default_tokens = int(policy.reserve_tokens * 0.8)
+    summary_max_tokens = _positive_int_env(
+        "SESSION_COMPACTION_SUMMARY_MAX_TOKENS", summary_default_tokens
+    )
     # 来自 s10：保持；根据真实接口选择摘要选项，不用模型名字猜测 API 参数。
     summary_options = summary_request_options(provider)
     summarizer = ContextSummarizer(
@@ -1317,12 +1374,19 @@ def main(arguments: Sequence[str] | None = None) -> None:
     )
     # 来自 s10：保持；Hook 干预行为，Event 只观察已经发生的事实。
     hooks = Hooks(before_tool_call=[make_permission_hook()])
+    # s11 修改：可选保护显式组装并注入，不在循环里隐藏固定的 12 轮限制。
+    round_limit = model_round_limit_from_env()
 
     print("s11：运行时系统 · 追踪与用量")
     print(f"Provider：{os.getenv('MODEL_PROVIDER', 'anthropic')}")
     print(f"模型：{provider.model}")
     print(f"会话文件：{session.path}")
     print(f"Trace 文件：{trace_path}")
+    # s11 修改：显示实际读入的配置，避免把旧 .env 字符参数误认为仍在生效。
+    print(
+        f"上下文配置：窗口 {policy.context_window_tokens}，触发 {policy.trigger_tokens}，近期保留 {policy.keep_recent_tokens} Token。"
+    )
+    print(f"回答轮数上限：{round_limit if round_limit is not None else '不限制'}")
     print("输入任务，输入 q 退出。\n")
 
     while True:
@@ -1348,6 +1412,8 @@ def main(arguments: Sequence[str] | None = None) -> None:
                 emit=events.emit,
                 save_message=session.append_message,
                 save_assistant=session.append_assistant,
+                # s11 修改：仅限制回答请求；默认 None，不强制生成一次额外收尾回答。
+                max_rounds=round_limit,
             )
         except (RuntimeError, ValueError) as error:
             print(format_error(str(error)), file=sys.stderr)

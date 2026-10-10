@@ -10,7 +10,7 @@ from s12_skill_loading import code as chapter
 def test_skills_chapter_reuses_runtime_summary_and_diagnostics():
     assert chapter.ContextSummarizer is chapter.previous.ContextSummarizer
     assert chapter.show_summary_diagnostic is chapter.previous.show_summary_diagnostic
-    assert chapter.MAX_MODEL_ROUNDS == chapter.previous.MAX_MODEL_ROUNDS
+    assert chapter.model_round_limit_from_env is chapter.previous.model_round_limit_from_env
 
 
 def _skill(root: Path, name: str, header: str, body: str = "正文专用标记") -> Path:
@@ -104,6 +104,7 @@ def test_main_loads_skill_via_existing_read_tool_and_persists_result(tmp_path, m
 
     monkeypatch.setattr(chapter, "create_model_provider", lambda **kwargs: Provider())
     monkeypatch.setattr(chapter, "load_dotenv", lambda **kwargs: None)
+    monkeypatch.setenv("MODEL_CONTEXT_WINDOW_TOKENS", "128000")
     monkeypatch.setattr(chapter, "SESSION_ROOT", tmp_path / "sessions" / "s12")
     monkeypatch.setattr(chapter, "TRACE_ROOT", tmp_path / "traces" / "s12")
     inputs = iter(["按 code-review 技能审查指定代码", "q"])
@@ -123,88 +124,80 @@ def test_main_loads_skill_via_existing_read_tool_and_persists_result(tmp_path, m
     assert any(record["type"] == "tool_call" for record in records)
 
 
-@pytest.mark.parametrize("limit", [None, 10000])
-def test_read_file_enforces_default_and_explicit_large_line_budget(tmp_path, monkeypatch, limit):
-    monkeypatch.setattr(chapter.s03, "WORKDIR", tmp_path)
-    path = tmp_path / "code.py"
-    path.write_text("\n".join(f"line {index}" for index in range(1, 201)), encoding="utf-8")
-    output = chapter.dispatch_tool("read_file", {"path": "code.py", "limit": limit})
-    body = output.split("\n\n[", 1)[0]
-    assert len(body.splitlines()) == chapter.READ_MAX_LINES
-    assert "start_line=81" in output
-    assert "line 81" not in body
+def test_skills_reuse_tool_definitions_and_dispatch_without_extra_limits():
+    assert chapter.TOOLS is chapter.previous.TOOLS
+    assert chapter.dispatch_tool is chapter.previous.dispatch_tool
+    assert any(tool["name"] == "grep" for tool in chapter.TOOLS)
 
 
-def test_character_budget_returns_complete_lines_and_correct_continuation(tmp_path, monkeypatch):
-    monkeypatch.setattr(chapter.s03, "WORKDIR", tmp_path)
-    path = tmp_path / "large.py"
-    lines = [str(index) + "中" * 999 for index in range(1, 11)]
-    path.write_text("\n".join(lines), encoding="utf-8")
-    collected: list[str] = []
-    start = 1
-    while True:
-        output = chapter.read_file("large.py", start_line=start, limit=10000)
-        body = output.split("\n\n[", 1)[0]
-        assert len(body) <= chapter.TOOL_OUTPUT_MAX_CHARS
-        collected.extend(body.splitlines())
-        match = re.search(r"start_line=(\d+)", output)
-        if match is None:
-            break
-        next_line = int(match.group(1))
-        assert next_line == start + len(body.splitlines())
-        start = next_line
-    assert collected == lines
+def test_review_entry_can_load_skill_locate_and_read_code_without_summary(tmp_path, monkeypatch):
+    manifest = chapter.SKILLS_ROOT / "code-review" / "SKILL.md"
+    source = "s12_skill_loading/code.py"
+    requests = []
+    target_line = None
 
+    class Provider:
+        model = "offline-review"
 
-def test_long_skill_can_be_read_completely_in_multiple_windows(tmp_path, monkeypatch):
-    monkeypatch.setattr(chapter.s03, "WORKDIR", tmp_path)
-    lines = [f"技能说明 {index}" for index in range(170)]
-    (tmp_path / "SKILL.md").write_text("\n".join(lines), encoding="utf-8")
-    collected: list[str] = []
-    for start in (1, 81, 161):
-        output = chapter.read_file("SKILL.md", start_line=start)
-        collected.extend(output.split("\n\n[", 1)[0].splitlines())
-    assert collected == lines
+        def complete(self, **kwargs):
+            pytest.fail("短审查不应触发摘要")
 
+        def stream(self, *, on_text, **kwargs):
+            nonlocal target_line
+            requests.append(kwargs)
+            if len(requests) == 1:
+                name, arguments = "read_file", {"path": manifest.as_posix()}
+            elif len(requests) == 2:
+                assert "grep" in kwargs["messages"][-1]["content"][0]["content"]
+                name, arguments = "grep", {"path": source, "pattern": "def scan"}
+            elif len(requests) == 3:
+                result = kwargs["messages"][-1]["content"][0]["content"]
+                target_line = int(re.search(r"code.py:(\d+):", result).group(1))
+                name, arguments = (
+                    "read_file",
+                    {"path": source, "start_line": target_line, "limit": 38},
+                )
+            else:
+                result = kwargs["messages"][-1]["content"][0]["content"]
+                assert "skills_root = root.resolve()" in result
+                assert "return cls(skills=tuple(skills))" in result
+                return chapter.ModelResponse(
+                    content=[{"type": "text", "text": "已取得完整目标方法；未执行测试。"}],
+                    model=self.model,
+                    stop_reason="end_turn",
+                    usage=chapter.previous.ModelUsage(input_tokens=100, output_tokens=20),
+                )
+            return chapter.ModelResponse(
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": f"call-{len(requests)}",
+                        "name": name,
+                        "input": arguments,
+                    }
+                ],
+                model=self.model,
+                stop_reason="tool_use",
+                usage=chapter.previous.ModelUsage(input_tokens=100, output_tokens=20),
+            )
 
-def test_oversized_single_line_reports_limit_without_skipping_it(tmp_path, monkeypatch):
-    monkeypatch.setattr(chapter.s03, "WORKDIR", tmp_path)
-    (tmp_path / "code.py").write_text("x" * 5000 + "\nnext line", encoding="utf-8")
-    output = chapter.dispatch_tool("read_file", {"path": "code.py"})
-    assert output.startswith("Error:")
-    assert "next line" not in output
-    assert len(output) < chapter.TOOL_OUTPUT_MAX_CHARS
-
-
-def test_bounded_read_keeps_workspace_permission_boundary(tmp_path, monkeypatch):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    monkeypatch.setattr(chapter.s03, "WORKDIR", workspace)
-    (tmp_path / "outside.py").write_text("private text", encoding="utf-8")
-    output = chapter.dispatch_tool("read_file", {"path": "../outside.py"})
-    assert output.startswith("Error:")
-    assert "private text" not in output
-
-
-def test_oversized_shell_output_is_archived_and_only_preview_is_returned(tmp_path, monkeypatch):
-    full_output = "shell line\n" * 10000 + "末尾证据"
-    monkeypatch.setattr(chapter, "SESSION_ROOT", tmp_path / "sessions" / "s12")
-    monkeypatch.setattr(chapter.previous, "dispatch_tool", lambda name, arguments: full_output)
-    output = chapter.dispatch_tool("bash", {"command": "offline-command"})
-    assert output.startswith(full_output[: chapter.TOOL_OUTPUT_MAX_CHARS])
-    assert len(output) < chapter.TOOL_OUTPUT_MAX_CHARS + 500
-    archive = next((chapter.SESSION_ROOT / "tool-results").glob("*.txt"))
-    assert archive.read_text(encoding="utf-8") == full_output
-    assert archive.as_posix() in output
-    assert "末尾证据" not in output
-
-
-def test_s12_tool_descriptions_do_not_mutate_s11_definitions():
-    original_read = next(tool for tool in chapter.previous.TOOLS if tool["name"] == "read_file")
-    current_read = next(tool for tool in chapter.TOOLS if tool["name"] == "read_file")
-    assert current_read is not original_read
-    assert current_read["description"] != original_read["description"]
-    assert current_read["input_schema"] == original_read["input_schema"]
+    monkeypatch.setattr(chapter, "create_model_provider", lambda **kwargs: Provider())
+    monkeypatch.setattr(chapter, "load_dotenv", lambda **kwargs: None)
+    monkeypatch.setenv("MODEL_CONTEXT_WINDOW_TOKENS", "128000")
+    monkeypatch.setenv("AGENT_MAX_ROUNDS", "0")
+    monkeypatch.setattr(chapter, "SESSION_ROOT", tmp_path / "sessions")
+    monkeypatch.setattr(chapter, "TRACE_ROOT", tmp_path / "traces")
+    inputs = iter(["按 code-review 技能只读审查 SkillCatalog.scan", "q"])
+    monkeypatch.setattr("builtins.input", lambda prompt: next(inputs))
+    chapter.main([])
+    assert len(requests) == 4
+    records = [
+        json.loads(line)
+        for line in next((tmp_path / "sessions").glob("*.jsonl"))
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert all(record["type"] == "message" for record in records)
 
 
 def test_repeated_tool_calls_stop_at_round_budget_and_keep_results(tmp_path):
@@ -282,7 +275,9 @@ def test_empty_summary_stops_before_compaction_and_assistant_request(tmp_path):
     )
     compactor = chapter.ContextCompactor(
         session=session,
-        policy=chapter.CompactionPolicy(max_context_chars=1000, keep_recent_chars=400),
+        policy=chapter.CompactionPolicy(
+            context_window_tokens=314, reserve_tokens=64, keep_recent_tokens=100
+        ),
         summarize=summarizer,
     )
     requester = chapter.CompactedContextRequester(

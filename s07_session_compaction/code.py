@@ -271,34 +271,58 @@ class SessionManager:
 # ===== s07 新增：自动压缩决策 =====
 
 
-# s07 修改：尾部改用字符预算，避免少量巨型工具结果让压缩失去效果。
+# s07 修改：压缩策略以 Token 表达模型容量，字符换算只在内部裁剪时使用。
 @dataclass(frozen=True)
 class CompactionPolicy:
-    """定义压缩阈值和最近上下文的字符预算。
+    """根据模型窗口定义压缩触发点和近期保留预算。
 
-    作用：用同一组可配置规则驱动每次模型请求前的压缩决策。
-    输入：活跃上下文最大字符数，以及压缩后最近消息可占用的最大字符数。
+    作用：将工具输出限制与会话压缩预算分开，不因固定的小字符阈值过早丢掉证据。
+    输入：实际模型窗口、预留 Token 和近期保留 Token。
     输出：通过校验的不可变策略对象。
-    流程：创建时为摘要保留至少一半空间；压缩器据此分割较早消息和最近尾部。
+    流程：窗口减预留得到触发点 → 校验近期预算 → 压缩器据此分割原始消息。
+    边界：s07 无统一 usage，使用字符除以四估算；s11 引入已知用量校准触发判断。
     """
 
-    max_context_chars: int
-    keep_recent_chars: int
+    # s07 修改：参考 Pi，模型窗口必须显式提供，不能从模型名字猜测容量。
+    context_window_tokens: int
+    reserve_tokens: int = 16384
+    keep_recent_tokens: int = 20000
 
     def __post_init__(self) -> None:
         """拒绝无法产生有效压缩边界的策略。"""
-        if self.max_context_chars < 256:
-            raise ValueError("上下文字符阈值不能小于 256")
-        if self.keep_recent_chars <= 0:
-            raise ValueError("最近上下文字符预算必须大于 0")
-        if self.keep_recent_chars > self.max_context_chars // 2:
-            raise ValueError("最近上下文字符预算不能超过总阈值的一半")
+        # s07 修改：预留必须小于窗口，近期预算必须落在压缩触发点以内。
+        if self.reserve_tokens <= 0 or self.context_window_tokens - self.reserve_tokens < 64:
+            raise ValueError("模型窗口减预留后必须至少有 64 Token；请检查模型窗口和预留配置")
+        if not 0 < self.keep_recent_tokens < self.trigger_tokens:
+            raise ValueError("近期保留 Token 必须大于 0 且小于压缩触发点")
+
+    # s07 新增：派生属性统一解释配置单位，避免入口和分割函数各自硬编码换算。
+    @property
+    def trigger_tokens(self) -> int:
+        """返回模型窗口减去预留余量后的触发点。"""
+        return self.context_window_tokens - self.reserve_tokens
+
+    @property
+    def max_context_chars(self) -> int:
+        """把 Token 触发点换成内部裁剪的近似字符预算，不作为外部配置。"""
+        return self.trigger_tokens * 4
+
+    @property
+    def keep_recent_chars(self) -> int:
+        """把近期 Token 预算换成内部消息分割的近似字符预算。"""
+        return self.keep_recent_tokens * 4
 
 
 # s07 新增：使用字符数近似上下文大小，保持阈值可观察且不依赖模型专有 token 统计。
 def estimate_context_chars(messages: Sequence[Message]) -> int:
     """估算模型消息序列序列化后的字符数。"""
     return len(json.dumps(messages, ensure_ascii=False, default=str))
+
+
+# s07 修改：与 Pi 的回退估算思路一致；这是近似值，不冒充模型实际分词结果。
+def estimate_context_tokens(messages: Sequence[Message]) -> int:
+    """用序列化字符数除以四向上取整，估算尚无 usage 的消息。"""
+    return (estimate_context_chars(messages) + 3) // 4 if messages else 0
 
 
 def _block_type(block: object) -> object:
@@ -382,18 +406,24 @@ class CompactionPlan:
 def prepare_compaction(
     entries: Sequence[SessionEntry],
     policy: CompactionPolicy,
+    # s07 修改：s11 可传入已有 usage 的估算，准备阶段仍不依赖 Provider 类型。
+    context_tokens: int | None = None,
 ) -> CompactionPlan | None:
     """根据完整会话日志准备一次压缩计划。
 
-    作用：找出旧摘要尚未覆盖的消息，并按字符预算划分待总结部分和保留尾部。
-    输入：按时间排列的完整 SessionEntry，以及当前压缩策略。
+    作用：按模型窗口判断是否压缩，再找出旧摘要尚未覆盖的消息和保留尾部。
+    输入：完整 SessionEntry、Token 策略与可选的已校准上下文 Token 估算。
     输出：上下文未超限时返回 None；需要压缩时返回 `CompactionPlan`。
     流程：投影当前上下文并检查大小 → 找到最新压缩点 → 合并上次保留尾部与
     压缩点后的新消息 → 按预算分割为待总结消息和保留尾部。
     """
     active_context = build_session_context(entries)
     before_chars = estimate_context_chars(active_context)
-    if before_chars <= policy.max_context_chars:
+    # s07 修改：按模型窗口判断；字符数只保留作显示和内部裁剪依据。
+    current_tokens = (
+        estimate_context_tokens(active_context) if context_tokens is None else context_tokens
+    )
+    if current_tokens <= policy.trigger_tokens:
         return None
 
     last_compaction_index = None
@@ -577,7 +607,7 @@ class ContextCompactor:
         )
         after_chars = estimate_context_chars(_summary_context(summary, plan.retained_tail))
         if after_chars > self.policy.max_context_chars:
-            raise RuntimeError("压缩后上下文仍超过字符阈值")
+            raise RuntimeError("压缩后上下文仍超过 Token 预算的近似字符上限")
         self.session.append_compaction(summary, plan.retained_tail)
         return CompactionOutcome(
             summary_kind=summary_kind,
@@ -831,12 +861,17 @@ def main(arguments: Sequence[str] | None = None) -> None:
     # s07 修改：复用 s05 的启动参数解析，但使用 s07 专属默认目录。
     session_path = s05.session_path_from_cli(arguments, session_root=SESSION_ROOT)
     session = SessionManager.open(session_path)
-    # s07 修改：总阈值和尾部字符预算共同保证压缩后仍有摘要空间。
+    # s07 修改：窗口须由配置明确提供；预留和近期预算参考 Pi，旧字符参数不再读取。
     policy = CompactionPolicy(
-        max_context_chars=_positive_int_env("SESSION_COMPACTION_MAX_CHARS", 24000),
-        keep_recent_chars=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_CHARS", 12000),
+        context_window_tokens=_positive_int_env("MODEL_CONTEXT_WINDOW_TOKENS", 0),
+        reserve_tokens=_positive_int_env("SESSION_COMPACTION_RESERVE_TOKENS", 16384),
+        keep_recent_tokens=_positive_int_env("SESSION_COMPACTION_KEEP_RECENT_TOKENS", 20000),
     )
-    summary_max_tokens = _positive_int_env("SESSION_COMPACTION_SUMMARY_MAX_TOKENS", 1024)
+    # s07 修改：摘要额度默认来自预留预算，仍允许单独设置明确的输出上限。
+    summary_default_tokens = int(policy.reserve_tokens * 0.8)
+    summary_max_tokens = _positive_int_env(
+        "SESSION_COMPACTION_SUMMARY_MAX_TOKENS", summary_default_tokens
+    )
     summarizer = ContextSummarizer(
         create_message=requester,
         max_tokens=summary_max_tokens,
@@ -854,8 +889,9 @@ def main(arguments: Sequence[str] | None = None) -> None:
     print("s07：会话系统 · 上下文压缩")
     print(f"会话文件：{session.path}")
     print(
-        f"压缩阈值：{policy.max_context_chars} 字符，"
-        f"最近上下文预算：{policy.keep_recent_chars} 字符。"
+        # s07 修改：显示配置中的 Token 预算，字符数只在压缩结果中作观察指标。
+        f"压缩触发点：{policy.trigger_tokens} Token，"
+        f"近期保留预算：{policy.keep_recent_tokens} Token。"
     )
     print("输入任务，输入 q 退出。\n")
 

@@ -358,7 +358,9 @@ def test_compaction_records_successful_summary_and_failed_attempt_separately(tmp
     )
     compactor = chapter.ContextCompactor(
         session=session,
-        policy=chapter.CompactionPolicy(max_context_chars=300, keep_recent_chars=80),
+        policy=chapter.CompactionPolicy(
+            context_window_tokens=139, reserve_tokens=64, keep_recent_tokens=20
+        ),
         summarize=summarizer,
     )
 
@@ -663,7 +665,9 @@ def test_summary_disables_thinking_at_provider_boundary_without_changing_normal_
     )
     compactor = chapter.ContextCompactor(
         session=session,
-        policy=chapter.CompactionPolicy(max_context_chars=1000, keep_recent_chars=400),
+        policy=chapter.CompactionPolicy(
+            context_window_tokens=314, reserve_tokens=64, keep_recent_tokens=100
+        ),
         summarize=summarizer,
     )
     outcome = compactor.compact_if_needed()
@@ -712,3 +716,89 @@ def test_runtime_guard_ends_task_and_preserves_completed_messages(fail_request):
     assert len(messages) == (1 if fail_request else 3)
     if not fail_request:
         assert messages[-1]["content"][0]["type"] == "tool_result"
+
+
+def test_context_estimate_uses_last_valid_usage_not_session_total(tmp_path):
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    session.append_message(_message("user", "历史原文" * 1000))
+    session.append_assistant(
+        _message("assistant", "已读"),
+        chapter.ModelResponse(
+            content=[{"type": "text", "text": "已读"}],
+            model="offline",
+            stop_reason="end_turn",
+            usage=chapter.ModelUsage(input_tokens=200, output_tokens=10, cache_read_tokens=50),
+        ),
+    )
+    later = _message("user", "补充问题")
+    session.append_message(later)
+    session.append_model_error("offline", "summary", chapter.ModelUsage(input_tokens=9000))
+    assert chapter.estimate_session_context_tokens(
+        session.load_entries()
+    ) == 260 + chapter.s07.estimate_context_tokens([later])
+
+
+def test_context_estimate_does_not_reuse_usage_before_compaction(tmp_path):
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    session.append_assistant(
+        _message("assistant", "旧回答"),
+        chapter.ModelResponse(
+            content=[],
+            model="offline",
+            stop_reason="end_turn",
+            usage=chapter.ModelUsage(input_tokens=100000),
+        ),
+    )
+    session.append_compaction("已总结旧任务", [])
+    session.append_message(_message("user", "新问题"))
+    assert chapter.estimate_session_context_tokens(
+        session.load_entries()
+    ) == chapter.s07.estimate_context_tokens(session.build_context())
+
+
+@pytest.mark.parametrize("raw,expected", [("0", None), ("3", 3)])
+def test_round_limit_is_an_independent_optional_configuration(monkeypatch, raw, expected):
+    monkeypatch.setenv("AGENT_MAX_ROUNDS", raw)
+    assert chapter.model_round_limit_from_env() == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "invalid"])
+def test_invalid_round_limit_is_rejected(monkeypatch, raw):
+    monkeypatch.setenv("AGENT_MAX_ROUNDS", raw)
+    with pytest.raises(ValueError):
+        chapter.model_round_limit_from_env()
+
+
+@pytest.mark.parametrize("skills", [False, True])
+def test_default_loop_can_finish_after_more_than_twelve_requests(skills):
+    from s12_skill_loading import code as skills_chapter
+
+    runtime = skills_chapter if skills else chapter
+    requests = []
+    executed = []
+
+    def request(**kwargs):
+        requests.append(kwargs)
+        content = (
+            [{"type": "tool_use", "id": f"t{len(requests)}", "name": "grep", "input": {}}]
+            if len(requests) <= 13
+            else [{"type": "text", "text": "已完成审查"}]
+        )
+        return runtime.ModelResponse(
+            content=content,
+            model="offline",
+            stop_reason="tool_use" if len(requests) <= 13 else "end_turn",
+            usage=chapter.ModelUsage(),
+        )
+
+    messages = runtime.agent_loop(
+        [_message("user", "只读审查")],
+        create_message=request,
+        dispatch=lambda name, args: executed.append(name) or "code.py:1",
+        system="test",
+        hooks=runtime.Hooks(),
+        emit=lambda event: None,
+    )
+    assert len(requests) == 14
+    assert len(executed) == 13
+    assert messages[-1]["content"][0]["text"] == "已完成审查"

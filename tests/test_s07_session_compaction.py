@@ -62,7 +62,9 @@ def test_compactor_persists_summary_and_recent_tail(tmp_path) -> None:
 
     compactor = chapter.ContextCompactor(
         session,
-        chapter.CompactionPolicy(max_context_chars=500, keep_recent_chars=220),
+        chapter.CompactionPolicy(
+            context_window_tokens=189, reserve_tokens=64, keep_recent_tokens=55
+        ),
         summarize,
     )
 
@@ -107,7 +109,9 @@ def test_prepare_compaction_combines_previous_tail_and_later_messages() -> None:
 
     plan = chapter.prepare_compaction(
         entries,
-        chapter.CompactionPolicy(max_context_chars=300, keep_recent_chars=100),
+        chapter.CompactionPolicy(
+            context_window_tokens=139, reserve_tokens=64, keep_recent_tokens=25
+        ),
     )
 
     assert plan is not None
@@ -128,7 +132,9 @@ def test_request_wrapper_compacts_then_uses_latest_context(tmp_path) -> None:
 
     compactor = chapter.ContextCompactor(
         session,
-        chapter.CompactionPolicy(max_context_chars=300, keep_recent_chars=100),
+        chapter.CompactionPolicy(
+            context_window_tokens=139, reserve_tokens=64, keep_recent_tokens=25
+        ),
         lambda messages, previous_summary: "第一条摘要",
     )
     chapter.CompactedContextRequester(
@@ -171,7 +177,9 @@ def test_compactor_bounds_huge_tool_result_and_converges(tmp_path) -> None:
 
     compactor = chapter.ContextCompactor(
         session,
-        chapter.CompactionPolicy(max_context_chars=1000, keep_recent_chars=300),
+        chapter.CompactionPolicy(
+            context_window_tokens=314, reserve_tokens=64, keep_recent_tokens=75
+        ),
         summarize,
     )
 
@@ -196,7 +204,9 @@ def test_next_compaction_updates_previous_summary_without_resummarizing_it(tmp_p
 
     compactor = chapter.ContextCompactor(
         session,
-        chapter.CompactionPolicy(max_context_chars=300, keep_recent_chars=100),
+        chapter.CompactionPolicy(
+            context_window_tokens=139, reserve_tokens=64, keep_recent_tokens=25
+        ),
         summarize,
     )
 
@@ -212,7 +222,9 @@ def test_compactor_keeps_original_context_when_summary_is_unavailable(tmp_path) 
     session.append_message(_message("user", "最新任务"))
     compactor = chapter.ContextCompactor(
         session,
-        chapter.CompactionPolicy(max_context_chars=300, keep_recent_chars=100),
+        chapter.CompactionPolicy(
+            context_window_tokens=139, reserve_tokens=64, keep_recent_tokens=25
+        ),
         lambda messages, previous_summary: None,
     )
 
@@ -299,3 +311,30 @@ def test_summary_request_options_can_be_overridden_for_another_api() -> None:
     )
     assert summarizer([_message("user", "任务")], None) == "摘要"
     assert "thinking" not in requests[0]
+
+
+def test_model_window_budget_does_not_compact_short_review_evidence(tmp_path):
+    policy = chapter.CompactionPolicy(context_window_tokens=128000)
+    assert policy.trigger_tokens == 111616
+    session = chapter.SessionManager.open(tmp_path / "session.jsonl")
+    session.append_message(_message("user", "请审查 scan"))
+    session.append_message(
+        _message("user", [{"type": "tool_result", "content": "代码证据" * 8000}])
+    )
+    assert chapter.estimate_context_chars(session.build_context()) > 24000
+    assert chapter.prepare_compaction(session.load_entries(), policy) is None
+
+
+def test_usage_estimate_can_trigger_compaction_even_when_visible_text_is_small():
+    policy = chapter.CompactionPolicy(context_window_tokens=128000)
+    entries = [chapter.MessageEntry.from_message(_message("user", "短正文"))]
+    assert chapter.prepare_compaction(entries, policy) is None
+    assert chapter.prepare_compaction(entries, policy, context_tokens=120000) is not None
+
+
+@pytest.mark.parametrize("window,reserve,keep", [(100, 100, 1), (100, 1, 100), (128000, 16384, 0)])
+def test_invalid_token_budgets_are_rejected(window, reserve, keep):
+    with pytest.raises(ValueError):
+        chapter.CompactionPolicy(
+            context_window_tokens=window, reserve_tokens=reserve, keep_recent_tokens=keep
+        )
